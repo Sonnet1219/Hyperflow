@@ -18,6 +18,7 @@ class LinearRAGConfig:
     passage_node_weight: float = 0.05
     damping: float = 0.5
     iteration_threshold: float = 0.5
+    bridge_diversity_weight: float = 0.3  # β: info-theoretic diversity penalty (0=pure similarity, 1=full MMR)
     use_vectorized_retrieval: bool = False  # True for vectorized matrix computation, False for BFS iteration
     enable_hybrid_attribute_fallback: bool = False
     attribute_keyword_boost: float = 0.25

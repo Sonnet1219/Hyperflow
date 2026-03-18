@@ -215,6 +215,94 @@ class LinearRAG:
         
         return sorted_passage_hash_ids, sorted_passage_scores.tolist()
 
+    def _select_bridges_with_info_gain(self, sentence_embeddings, sentence_similarities, top_k):
+        """
+        Greedy bridge selection using information-theoretic gain.
+        info_gain(s) = sim(s, query) × (1 - β × max_sim(s, already_selected))
+        Selects diverse, high-relevance bridge sentences instead of naive top-k.
+        """
+        n = len(sentence_similarities)
+        if n == 0:
+            return np.array([], dtype=int)
+        if top_k <= 1 or n <= 1:
+            return np.argsort(sentence_similarities)[::-1][:min(top_k, n)]
+
+        beta = self.config.bridge_diversity_weight
+        if beta == 0:
+            return np.argsort(sentence_similarities)[::-1][:min(top_k, n)]
+
+        selected = []
+        selected_embeddings = []
+        candidates = list(range(n))
+
+        for _ in range(min(top_k, n)):
+            best_idx = -1
+            best_gain = -float('inf')
+            for idx in candidates:
+                sim_q = sentence_similarities[idx]
+                if not selected_embeddings:
+                    redundancy = 0.0
+                else:
+                    sims_to_selected = np.dot(
+                        np.array(selected_embeddings),
+                        sentence_embeddings[idx]
+                    )
+                    redundancy = float(np.max(sims_to_selected))
+                gain = sim_q * (1.0 - beta * redundancy)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_idx = idx
+            if best_idx < 0:
+                break
+            selected.append(best_idx)
+            selected_embeddings.append(sentence_embeddings[best_idx])
+            candidates.remove(best_idx)
+
+        return np.array(selected, dtype=int)
+
+    def _select_bridges_with_info_gain_torch(self, available_sentence_indices, sentence_sims, top_k):
+        """
+        PyTorch version of greedy info-gain bridge selection for the vectorized path.
+        Uses self.sentence_embeddings_tensor for inter-sentence similarity computation.
+        Returns local indices (relative to available_sentence_indices).
+        """
+        n = len(sentence_sims)
+        if n <= 1 or top_k <= 1:
+            _, top_k_local = torch.topk(sentence_sims, min(top_k, n))
+            return top_k_local
+
+        beta = self.config.bridge_diversity_weight
+        if beta == 0:
+            _, top_k_local = torch.topk(sentence_sims, min(top_k, n))
+            return top_k_local
+
+        # Get actual embeddings for available sentences
+        global_indices = available_sentence_indices.cpu().numpy()
+        embeddings = self.sentence_embeddings[global_indices]  # (n, dim)
+
+        selected_local = []
+        selected_embs = []
+        mask = torch.ones(n, dtype=torch.bool, device=sentence_sims.device)
+
+        for _ in range(min(top_k, n)):
+            if not selected_embs:
+                gains = sentence_sims.clone()
+            else:
+                sel_emb_np = np.array(selected_embs)  # (num_sel, dim)
+                # Compute max similarity of each candidate to any selected sentence
+                inter_sims = np.dot(embeddings, sel_emb_np.T)  # (n, num_sel)
+                max_redundancy = np.max(inter_sims, axis=1)  # (n,)
+                redundancy_tensor = torch.from_numpy(max_redundancy).float().to(sentence_sims.device)
+                gains = sentence_sims * (1.0 - beta * redundancy_tensor)
+
+            gains = torch.where(mask, gains, torch.full_like(gains, -float('inf')))
+            best_local = torch.argmax(gains).item()
+            selected_local.append(best_local)
+            selected_embs.append(embeddings[best_local])
+            mask[best_local] = False
+
+        return torch.tensor(selected_local, dtype=torch.long, device=sentence_sims.device)
+
     def calculate_entity_scores(self,question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores):
         actived_entities = {}
         entity_weights = np.zeros(len(self.graph.vs["name"]))
@@ -237,7 +325,9 @@ class LinearRAG:
                 sentence_embeddings = self.sentence_embeddings[sentence_indices]
                 question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
                 sentence_similarities = np.dot(sentence_embeddings, question_emb).flatten()
-                top_sentence_indices = np.argsort(sentence_similarities)[::-1][:self.config.top_k_sentence]
+                top_sentence_indices = self._select_bridges_with_info_gain(
+                    sentence_embeddings, sentence_similarities, self.config.top_k_sentence
+                )
                 for top_sentence_index in top_sentence_indices:
                     top_sentence_hash_id = sentence_hash_ids[top_sentence_index]
                     top_sentence_score = sentence_similarities[top_sentence_index]
@@ -380,11 +470,15 @@ class LinearRAG:
                     # Get sentence similarities (for ranking)
                     sentence_sims = sentence_similarities[available_sentence_indices]
                     
-                    # Select top-k sentences based ONLY on sentence similarity (matches BFS line 240)
-                    # NOT weighted by entity_score at selection time
+                    # Select top-k sentences using info-theoretic bridge selection
                     k = min(self.config.top_k_sentence, len(sentence_sims))
                     if k > 0:
-                        top_k_values, top_k_local_indices = torch.topk(sentence_sims, k)
+                        if k <= 1 or self.config.bridge_diversity_weight == 0:
+                            _, top_k_local_indices = torch.topk(sentence_sims, k)
+                        else:
+                            top_k_local_indices = self._select_bridges_with_info_gain_torch(
+                                available_sentence_indices, sentence_sims, k
+                            )
                         top_k_sentence_indices = available_sentence_indices[top_k_local_indices]
                         selected_sentence_indices_list.append(top_k_sentence_indices)
                 

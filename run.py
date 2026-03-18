@@ -11,7 +11,7 @@ from src.utils import LLM_Model
 from src.utils import setup_logging
 from datetime import datetime
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 warnings.filterwarnings('ignore')
 
 def parse_arguments():
@@ -26,6 +26,7 @@ def parse_arguments():
     parser.add_argument("--passage_ratio", type=float, default=2, help="The ratio for passage")
     parser.add_argument("--top_k_sentence", type=int, default=3, help="The top k sentence to use")
     parser.add_argument("--use_vectorized_retrieval", action="store_true", help="Use vectorized matrix-based retrieval instead of BFS iteration")
+    parser.add_argument("--bridge_diversity_weight", type=float, default=0.3, help="Info-theoretic diversity penalty weight for bridge selection (0=pure similarity, 1=full MMR)")
     return parser.parse_args()
 
 
@@ -61,7 +62,8 @@ def main():
         iteration_threshold=args.iteration_threshold,
         passage_ratio=args.passage_ratio,
         top_k_sentence=args.top_k_sentence,
-        use_vectorized_retrieval=args.use_vectorized_retrieval
+        use_vectorized_retrieval=args.use_vectorized_retrieval,
+        bridge_diversity_weight=args.bridge_diversity_weight
     )
     rag_model = LinearRAG(global_config=config)
     rag_model.index(passages)
