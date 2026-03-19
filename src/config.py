@@ -20,6 +20,9 @@ class LinearRAGConfig:
     iteration_threshold: float = 0.5
     bridge_diversity_weight: float = 0.3  # β: info-theoretic diversity penalty (0=pure similarity, 1=full MMR)
     use_vectorized_retrieval: bool = False  # True for vectorized matrix computation, False for BFS iteration
+    use_query_evolution: bool = False  # Enable query evolution / semantic steering across hops
+    query_evolution_inertia: float = 0.7  # α: retention of original query intent (0=full evolution, 1=no evolution)
+    query_evolution_steering: float = 0.5  # γ: bridge sentence steering strength
     enable_hybrid_attribute_fallback: bool = False
     attribute_keyword_boost: float = 0.25
     attribute_query_keywords: list[str] = field(default_factory=lambda: [

@@ -27,6 +27,9 @@ def parse_arguments():
     parser.add_argument("--top_k_sentence", type=int, default=3, help="The top k sentence to use")
     parser.add_argument("--use_vectorized_retrieval", action="store_true", help="Use vectorized matrix-based retrieval instead of BFS iteration")
     parser.add_argument("--bridge_diversity_weight", type=float, default=0.3, help="Info-theoretic diversity penalty weight for bridge selection (0=pure similarity, 1=full MMR)")
+    parser.add_argument("--use_query_evolution", action="store_true", help="Enable query evolution / semantic steering across hops")
+    parser.add_argument("--query_evolution_inertia", type=float, default=0.7, help="α: retention of original query intent (0=full evolution, 1=no evolution)")
+    parser.add_argument("--query_evolution_steering", type=float, default=0.5, help="γ: bridge sentence steering strength")
     return parser.parse_args()
 
 
@@ -63,7 +66,10 @@ def main():
         passage_ratio=args.passage_ratio,
         top_k_sentence=args.top_k_sentence,
         use_vectorized_retrieval=args.use_vectorized_retrieval,
-        bridge_diversity_weight=args.bridge_diversity_weight
+        bridge_diversity_weight=args.bridge_diversity_weight,
+        use_query_evolution=args.use_query_evolution,
+        query_evolution_inertia=args.query_evolution_inertia,
+        query_evolution_steering=args.query_evolution_steering
     )
     rag_model = LinearRAG(global_config=config)
     rag_model.index(passages)

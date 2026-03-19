@@ -313,8 +313,16 @@ class LinearRAG:
         used_sentence_hash_ids = set()
         current_entities = actived_entities.copy()
         iteration = 1
+        # Query Evolution: track original and evolving query
+        if self.config.use_query_evolution:
+            q0 = question_embedding.copy()
+            current_query = question_embedding.copy()
+        else:
+            current_query = question_embedding
         while len(current_entities) > 0 and iteration < self.config.max_iterations:
             new_entities = {}
+            bridge_embeddings_this_hop = []
+            bridge_similarities_this_hop = []
             for entity_hash_id, (entity_id, entity_score, tier) in current_entities.items():
                 if entity_score < self.config.iteration_threshold:
                     continue
@@ -323,7 +331,7 @@ class LinearRAG:
                     continue
                 sentence_indices = [self.sentence_embedding_store.hash_id_to_idx[sid] for sid in sentence_hash_ids]
                 sentence_embeddings = self.sentence_embeddings[sentence_indices]
-                question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
+                question_emb = current_query.reshape(-1, 1) if len(current_query.shape) == 1 else current_query
                 sentence_similarities = np.dot(sentence_embeddings, question_emb).flatten()
                 top_sentence_indices = self._select_bridges_with_info_gain(
                     sentence_embeddings, sentence_similarities, self.config.top_k_sentence
@@ -332,6 +340,10 @@ class LinearRAG:
                     top_sentence_hash_id = sentence_hash_ids[top_sentence_index]
                     top_sentence_score = sentence_similarities[top_sentence_index]
                     used_sentence_hash_ids.add(top_sentence_hash_id)
+                    # Collect bridge info for query evolution
+                    if self.config.use_query_evolution:
+                        bridge_embeddings_this_hop.append(sentence_embeddings[top_sentence_index])
+                        bridge_similarities_this_hop.append(float(top_sentence_score))
                     entity_hash_ids_in_sentence = self.sentence_hash_id_to_entity_hash_ids[top_sentence_hash_id]
                     for next_entity_hash_id in entity_hash_ids_in_sentence:
                         next_entity_score = entity_score * top_sentence_score
@@ -340,6 +352,18 @@ class LinearRAG:
                         next_enitity_node_idx = self.node_name_to_vertex_idx[next_entity_hash_id]
                         entity_weights[next_enitity_node_idx] += next_entity_score
                         new_entities[next_entity_hash_id] = (next_enitity_node_idx, next_entity_score, iteration+1)
+            # Query Evolution: evolve query using bridge sentence information
+            if self.config.use_query_evolution and bridge_embeddings_this_hop:
+                bridge_embs = np.array(bridge_embeddings_this_hop)
+                bridge_sims = np.array(bridge_similarities_this_hop)
+                bridge_weights = bridge_sims / (bridge_sims.sum() + 1e-8)
+                bridge_info = np.dot(bridge_weights, bridge_embs)  # (dim,)
+                alpha = self.config.query_evolution_inertia
+                gamma = self.config.query_evolution_steering
+                current_query = alpha * q0 + (1 - alpha) * (current_query + gamma * bridge_info)
+                norm = np.linalg.norm(current_query)
+                if norm > 0:
+                    current_query = current_query / norm
             actived_entities.update(new_entities)
             current_entities = new_entities.copy()
             iteration += 1
@@ -365,7 +389,11 @@ class LinearRAG:
         
         # Convert to torch tensors and move to device
         sentence_similarities = torch.from_numpy(sentence_similarities_np).float().to(self.device)
-        
+
+        # Query Evolution: preserve original query embedding
+        if self.config.use_query_evolution:
+            q0_emb = question_emb.copy()  # (dim, 1) - never changes
+
         # Track used sentences for deduplication (like BFS version)
         used_sentence_mask = torch.zeros(num_sentences, dtype=torch.bool, device=self.device)
         
@@ -394,6 +422,8 @@ class LinearRAG:
         
         # Iterative matrix-based propagation using sparse matrices on GPU
         for iteration in range(1, self.config.max_iterations):
+            hop_selected_sentences = None  # Track selected bridges for query evolution
+
             # Convert sparse tensor to dense for threshold operation
             current_entity_scores_dense = current_entity_scores_sparse.to_dense()
             
@@ -486,7 +516,8 @@ class LinearRAG:
                 if len(selected_sentence_indices_list) > 0:
                     all_selected_sentences = torch.cat(selected_sentence_indices_list)
                     unique_selected_sentences = torch.unique(all_selected_sentences)
-                    
+                    hop_selected_sentences = unique_selected_sentences
+
                     # Mark selected sentences as used
                     used_sentence_mask[unique_selected_sentences] = True
                     
@@ -553,9 +584,29 @@ class LinearRAG:
             if len(next_nonzero_indices) > 0:
                 next_nonzero_values = next_entity_scores_dense[next_nonzero_indices]
                 current_entity_scores_sparse = torch.sparse_coo_tensor(
-                    next_nonzero_indices.unsqueeze(0), next_nonzero_values, 
+                    next_nonzero_indices.unsqueeze(0), next_nonzero_values,
                     (num_entities,), device=self.device
                 ).coalesce()
+
+                # Query Evolution: evolve query for next iteration
+                if self.config.use_query_evolution and hop_selected_sentences is not None and len(hop_selected_sentences) > 0:
+                    bridge_indices_np = hop_selected_sentences.cpu().numpy()
+                    bridge_embs = self.sentence_embeddings[bridge_indices_np]
+                    bridge_sims = sentence_similarities[hop_selected_sentences].cpu().numpy()
+                    bridge_weights = bridge_sims / (bridge_sims.sum() + 1e-8)
+                    bridge_info = np.dot(bridge_weights, bridge_embs)  # (dim,)
+                    alpha = self.config.query_evolution_inertia
+                    gamma = self.config.query_evolution_steering
+                    q0_flat = q0_emb.flatten()
+                    current_flat = question_emb.flatten()
+                    evolved = alpha * q0_flat + (1 - alpha) * (current_flat + gamma * bridge_info)
+                    norm = np.linalg.norm(evolved)
+                    if norm > 0:
+                        evolved = evolved / norm
+                    question_emb = evolved.reshape(-1, 1)
+                    # Recompute sentence similarities with evolved query
+                    sentence_similarities_np = np.dot(self.sentence_embeddings, question_emb).flatten()
+                    sentence_similarities = torch.from_numpy(sentence_similarities_np).float().to(self.device)
             else:
                 break
         
