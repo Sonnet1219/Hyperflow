@@ -91,9 +91,9 @@ class LinearRAG:
         self.node_name_to_vertex_idx = {v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()}
         self.vertex_idx_to_node_name = {v.index: v["name"] for v in self.graph.vs if "name" in v.attributes()}
 
-        # Precompute sparse matrices for vectorized retrieval if needed
-        if self.config.use_vectorized_retrieval:
-            logger.info("Precomputing sparse adjacency matrices for vectorized retrieval...")
+        # Precompute sparse matrices for vectorized retrieval or hypergraph diffusion
+        if self.config.use_vectorized_retrieval or self.config.use_hypergraph_diffusion:
+            logger.info("Precomputing sparse adjacency matrices...")
             self._precompute_sparse_matrices()
             e2s_shape = self.entity_to_sentence_sparse.shape
             s2e_shape = self.sentence_to_entity_sparse.shape
@@ -103,6 +103,9 @@ class LinearRAG:
             logger.info(f"E2S Sparsity: {(1 - e2s_nnz / (e2s_shape[0] * e2s_shape[1])) * 100:.2f}% (nnz={e2s_nnz})")
             logger.info(f"S2E Sparsity: {(1 - s2e_nnz / (s2e_shape[0] * s2e_shape[1])) * 100:.2f}% (nnz={s2e_nnz})")
             logger.info(f"Device: {self.device}")
+        if self.config.use_hypergraph_diffusion:
+            logger.info("Precomputing hypergraph degree vectors...")
+            self._precompute_hypergraph_degrees()
 
         retrieval_results = []
         for question_info in tqdm(questions, desc="Retrieving"):
@@ -182,9 +185,23 @@ class LinearRAG:
                 torch.zeros((2, 0), dtype=torch.long), torch.zeros(0, dtype=torch.float32),
                 (num_sentences, num_entities), device=self.device
             )
-            
+
+    def _precompute_hypergraph_degrees(self):
+        """Precompute vertex and hyperedge degree vectors for hypergraph Laplacian normalization."""
+        H = self.entity_to_sentence_sparse  # (num_entities, num_sentences) = incidence matrix
+        ones_e = torch.ones(H.shape[1], 1, device=self.device)
+        d_v = torch.sparse.mm(H, ones_e).squeeze()  # vertex degree: num hyperedges per entity
+        ones_v = torch.ones(H.shape[0], 1, device=self.device)
+        d_e = torch.sparse.mm(H.t(), ones_v).squeeze()  # hyperedge degree: num entities per sentence
+        self.d_v_inv_sqrt = torch.where(d_v > 0, d_v.pow(-0.5), torch.zeros_like(d_v))
+        self.d_e_inv = torch.where(d_e > 0, d_e.pow(-1.0), torch.zeros_like(d_e))
+        logger.info(f"Hypergraph degrees: D_v range [{d_v.min():.0f}, {d_v.max():.0f}], "
+                    f"D_e range [{d_e.min():.0f}, {d_e.max():.0f}]")
+
     def graph_search_with_seed_entities(self, question, question_embedding, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores):
-        if self.config.use_vectorized_retrieval:
+        if self.config.use_hypergraph_diffusion:
+            entity_weights, actived_entities = self.calculate_entity_scores_hypergraph(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
+        elif self.config.use_vectorized_retrieval:
             entity_weights, actived_entities = self.calculate_entity_scores_vectorized(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
         else:
             entity_weights, actived_entities = self.calculate_entity_scores(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
@@ -622,6 +639,122 @@ class LinearRAG:
             entity_weights[entity_node_idx] = float(score)
         
         return entity_weights, actived_entities
+
+    def calculate_entity_scores_hypergraph(self, question_embedding, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores):
+        """
+        Hypergraph spectral diffusion with flow damping and adaptive activation.
+        Operator: Theta = D_v^{-1/2} H W_q^{(t)} D_e^{-1} H^T D_v^{-1/2}
+        Update:   f^{t+1} = alpha * Theta @ f^{t} + (1-alpha) * f^{0}
+        Flow damping: W_q^{(t)} = W_q * gamma^flow_cumulative (soft deduplication)
+        Activation: adaptive threshold = top_score * activation_ratio
+        """
+        num_entities = len(self.entity_hash_ids)
+        num_sentences = len(self.sentence_hash_ids)
+        entity_weights = np.zeros(len(self.graph.vs["name"]))
+
+        # Phase A: Initialize f^(0) from seed entities
+        f0 = torch.zeros(num_entities, device=self.device)
+        for idx, score in zip(seed_entity_indices, seed_entity_scores):
+            f0[idx] = float(score)
+        f0_norm = f0.norm()
+        if f0_norm > 0:
+            f0 = f0 / f0_norm
+
+        # Phase B: Query-adaptive hyperedge weights W_q
+        question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
+        sentence_sims = np.dot(self.sentence_embeddings, question_emb).flatten()
+        w_q = torch.from_numpy(sentence_sims).float().to(self.device).clamp(min=0)
+
+        # Phase C: Select H and degree matrices (context modulation or binary)
+        if self.config.use_context_modulation:
+            H = self._build_context_modulated_H(question_embedding)
+            H_T = H.t()
+            d_v = torch.sparse.mm(H, torch.ones(H.shape[1], 1, device=self.device)).squeeze()
+            d_e = torch.sparse.mm(H_T, torch.ones(H.shape[0], 1, device=self.device)).squeeze()
+            d_v_inv_sqrt = torch.where(d_v > 0, d_v.pow(-0.5), torch.zeros_like(d_v))
+            d_e_inv = torch.where(d_e > 0, d_e.pow(-1.0), torch.zeros_like(d_e))
+        else:
+            H = self.entity_to_sentence_sparse
+            H_T = H.t()
+            d_v_inv_sqrt = self.d_v_inv_sqrt
+            d_e_inv = self.d_e_inv
+
+        # Phase D: Iterative spectral diffusion with hyperedge flow damping
+        alpha = self.config.hypergraph_alpha
+        gamma = self.config.hypergraph_damping_gamma
+        f = f0.clone()
+        flow_cumulative = torch.zeros(num_sentences, device=self.device)
+
+        for t in range(self.config.hypergraph_max_iterations):
+            # Apply flow damping: sentences that already carried signal get attenuated
+            w_q_damped = w_q * (gamma ** flow_cumulative)
+
+            step1 = d_v_inv_sqrt * f                                          # D_v^{-1/2} @ f
+            step2 = torch.sparse.mm(H_T, step1.unsqueeze(1)).squeeze(1)       # H^T @ step1
+            step3 = d_e_inv * step2                                           # D_e^{-1} @ step2
+            step4 = w_q_damped * step3                                        # W_q^{(t)} @ step3
+            step5 = torch.sparse.mm(H, step4.unsqueeze(1)).squeeze(1)         # H @ step4
+            theta_f = d_v_inv_sqrt * step5                                    # D_v^{-1/2} @ step5
+
+            f_new = alpha * theta_f + (1 - alpha) * f0
+
+            # Accumulate flow for damping next iteration
+            flow_cumulative += step4.abs()
+
+            delta = (f_new - f).norm().item()
+            f = f_new
+            if delta < self.config.hypergraph_convergence_tol:
+                logger.debug(f"Hypergraph diffusion converged at iteration {t+1} (delta={delta:.6f})")
+                break
+
+        # Phase E: Convert to entity_weights and actived_entities
+        if f0_norm > 0:
+            f = f * f0_norm
+        entity_scores_np = f.cpu().numpy()
+
+        # Adaptive activation threshold: top_score * ratio
+        top_score = entity_scores_np.max()
+        adaptive_threshold = top_score * self.config.hypergraph_activation_ratio
+
+        actived_entities = {}
+        for idx, entity, hash_id, score in zip(seed_entity_indices, seed_entities,
+                                                seed_entity_hash_ids, seed_entity_scores):
+            actived_entities[hash_id] = (idx, score, 1)
+            if hash_id in self.node_name_to_vertex_idx:
+                node_idx = self.node_name_to_vertex_idx[hash_id]
+                entity_weights[node_idx] = score
+
+        for entity_idx in range(num_entities):
+            score = entity_scores_np[entity_idx]
+            if score >= adaptive_threshold:
+                hash_id = self.entity_hash_ids[entity_idx]
+                if hash_id in self.node_name_to_vertex_idx:
+                    node_idx = self.node_name_to_vertex_idx[hash_id]
+                    entity_weights[node_idx] = max(entity_weights[node_idx], float(score))
+                    if hash_id not in actived_entities:
+                        actived_entities[hash_id] = (entity_idx, float(score), 1)
+
+        return entity_weights, actived_entities
+
+    def _build_context_modulated_H(self, query_embedding):
+        """Build context-modulated incidence matrix: H_ctx[v,e] = cos_sim(entity_v * sentence_e, query)."""
+        H = self.entity_to_sentence_sparse.coalesce()
+        indices = H.indices()  # (2, nnz)
+        entity_indices = indices[0].cpu().numpy()
+        sentence_indices = indices[1].cpu().numpy()
+
+        entity_embs = self.entity_embeddings[entity_indices]       # (nnz, dim)
+        sentence_embs = self.sentence_embeddings[sentence_indices]  # (nnz, dim)
+        context_embs = entity_embs * sentence_embs                  # Hadamard product
+
+        norms = np.linalg.norm(context_embs, axis=1, keepdims=True)
+        context_embs = context_embs / np.maximum(norms, 1e-8)
+        query_emb = query_embedding.reshape(-1, 1) if len(query_embedding.shape) == 1 else query_embedding
+        sims = np.dot(context_embs, query_emb).flatten()
+        sims = np.maximum(sims, 0.0)
+
+        values = torch.from_numpy(sims.astype(np.float32)).to(self.device)
+        return torch.sparse_coo_tensor(indices, values, H.shape, device=self.device).coalesce()
 
     def calculate_passage_scores(self, question, question_embedding, actived_entities):
         passage_weights = np.zeros(len(self.graph.vs["name"]))

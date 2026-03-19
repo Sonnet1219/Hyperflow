@@ -30,6 +30,13 @@ def parse_arguments():
     parser.add_argument("--use_query_evolution", action="store_true", help="Enable query evolution / semantic steering across hops")
     parser.add_argument("--query_evolution_inertia", type=float, default=0.7, help="α: retention of original query intent (0=full evolution, 1=no evolution)")
     parser.add_argument("--query_evolution_steering", type=float, default=0.5, help="γ: bridge sentence steering strength")
+    parser.add_argument("--use_hypergraph_diffusion", action="store_true", help="Use hypergraph spectral diffusion for entity propagation")
+    parser.add_argument("--hypergraph_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
+    parser.add_argument("--hypergraph_max_iterations", type=int, default=10, help="Max iterations for diffusion convergence")
+    parser.add_argument("--hypergraph_convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
+    parser.add_argument("--hypergraph_damping_gamma", type=float, default=0.5, help="Hyperedge flow damping rate (0=hard dedup, 1=no damping)")
+    parser.add_argument("--hypergraph_activation_ratio", type=float, default=0.05, help="Adaptive threshold: activate if score >= top_score * ratio")
+    parser.add_argument("--use_context_modulation", action="store_true", help="Enable context-modulated incidence matrix")
     return parser.parse_args()
 
 
@@ -69,7 +76,14 @@ def main():
         bridge_diversity_weight=args.bridge_diversity_weight,
         use_query_evolution=args.use_query_evolution,
         query_evolution_inertia=args.query_evolution_inertia,
-        query_evolution_steering=args.query_evolution_steering
+        query_evolution_steering=args.query_evolution_steering,
+        use_hypergraph_diffusion=args.use_hypergraph_diffusion,
+        hypergraph_alpha=args.hypergraph_alpha,
+        hypergraph_max_iterations=args.hypergraph_max_iterations,
+        hypergraph_convergence_tol=args.hypergraph_convergence_tol,
+        hypergraph_damping_gamma=args.hypergraph_damping_gamma,
+        hypergraph_activation_ratio=args.hypergraph_activation_ratio,
+        use_context_modulation=args.use_context_modulation
     )
     rag_model = LinearRAG(global_config=config)
     rag_model.index(passages)
