@@ -143,19 +143,44 @@ def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, senten
         d_v_inv_sqrt_local = d_v_inv_sqrt
         d_e_inv_local = d_e_inv
 
-    # Phase D: Iterative spectral diffusion with hyperedge flow damping
+    # Phase D: Iterative spectral diffusion with flow damping + semantic novelty damping
     alpha = config.diffusion_alpha
     gamma = config.flow_damping
+    beta = config.semantic_novelty_weight
     f = f0.clone()
     flow_cumulative = torch.zeros(num_sentences, device=device)
 
+    # Precompute normalized sentence embeddings on GPU for novelty computation
+    if beta > 0:
+        sent_emb_tensor = torch.from_numpy(sentence_embeddings).float().to(device)  # (S, D)
+        sent_emb_norms = sent_emb_tensor.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        sent_emb_normed = sent_emb_tensor / sent_emb_norms                          # (S, D)
+
     for t in range(config.diffusion_max_iter):
+        # Flow damping: penalize overused individual hyperedges
         w_q_damped = w_q * (gamma ** flow_cumulative)
+
+        # Semantic novelty damping: penalize sentences similar to already-explored direction
+        if beta > 0 and t > 0 and flow_cumulative.sum() > 0:
+            # Explored centroid = flow-weighted average of sentence embeddings
+            weights_for_centroid = flow_cumulative.unsqueeze(1)                      # (S, 1)
+            explored_centroid = (weights_for_centroid * sent_emb_tensor).sum(dim=0)  # (D,)
+            centroid_norm = explored_centroid.norm().clamp(min=1e-8)
+            explored_centroid = explored_centroid / centroid_norm                     # (D,)
+
+            # Redundancy = cosine similarity to explored centroid
+            redundancy = torch.mv(sent_emb_normed, explored_centroid).clamp(min=0)   # (S,)
+
+            # Novelty factor: suppress sentences aligned with explored territory
+            novelty = 1.0 - beta * redundancy                                        # (S,)
+            w_q_final = w_q_damped * novelty
+        else:
+            w_q_final = w_q_damped
 
         step1 = d_v_inv_sqrt_local * f                                          # D_v^{-1/2} @ f
         step2 = torch.sparse.mm(H_T, step1.unsqueeze(1)).squeeze(1)            # H^T @ step1
         step3 = d_e_inv_local * step2                                           # D_e^{-1} @ step2
-        step4 = w_q_damped * step3                                              # W_q^{(t)} @ step3
+        step4 = w_q_final * step3                                               # W_q^{(t)} @ step3
         step5 = torch.sparse.mm(H, step4.unsqueeze(1)).squeeze(1)              # H @ step4
         theta_f = d_v_inv_sqrt_local * step5                                    # D_v^{-1/2} @ step5
 

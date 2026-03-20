@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf", help="The spacy model to use")
-    parser.add_argument("--embedding_model", type=str, default="model/all-mpnet-base-v2", help="The path of embedding model to use")
+    parser.add_argument("--embedding_model", type=str, default="BAAI/bge-large-en-v1.5", help="The path of embedding model to use")
     parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
     parser.add_argument("--llm_model", type=str, default="gpt-4o-mini", help="The LLM model to use")
     parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
@@ -26,10 +26,11 @@ def parse_arguments():
     parser.add_argument("--convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
     parser.add_argument("--flow_damping", type=float, default=0.5, help="Hyperedge flow damping rate (0=hard dedup, 1=no damping)")
     parser.add_argument("--activation_ratio", type=float, default=0.05, help="Adaptive threshold: activate if score >= top_score * ratio")
+    parser.add_argument("--semantic_novelty_weight", type=float, default=0.5, help="Semantic novelty damping strength (0=off, 1=full suppression)")
     parser.add_argument("--use_context_modulation", action="store_true", help="Enable context-modulated incidence matrix")
     parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B", help="Local or Hub path for the reranker model")
-    parser.add_argument("--reranker_candidate_top_k", type=int, default=20, help="How many retrieval candidates to pass into the reranker")
-    parser.add_argument("--reranker_batch_size", type=int, default=2, help="Batch size for local reranker scoring")
+    parser.add_argument("--reranker_candidate_top_k", type=int, default=30, help="How many retrieval candidates to pass into the reranker")
+    parser.add_argument("--reranker_batch_size", type=int, default=2, help="Batch size for reranker scoring")
     parser.add_argument("--reranker_max_length", type=int, default=4096, help="Max token length for reranker inputs")
     parser.add_argument("--question_limit", type=int, default=None, help="Optional limit for the number of questions to run")
     parser.add_argument("--skip_evaluation", action="store_true", help="Skip the answer evaluation stage")
@@ -72,6 +73,7 @@ def main():
         diffusion_max_iter=args.diffusion_max_iter,
         convergence_tol=args.convergence_tol,
         flow_damping=args.flow_damping,
+        semantic_novelty_weight=args.semantic_novelty_weight,
         activation_ratio=args.activation_ratio,
         use_context_modulation=args.use_context_modulation,
         reranker_model_name=args.reranker_model,

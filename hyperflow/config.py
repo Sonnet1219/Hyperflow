@@ -5,7 +5,8 @@ from hyperflow.utils import LLM_Model
 @dataclass
 class HyperflowConfig:
     dataset_name: str
-    embedding_model: str = "all-mpnet-base-v2"
+    embedding_model: str = "BAAI/bge-large-en-v1.5"
+    query_instruction_prefix: str = "Represent this sentence for searching relevant passages: "
     llm_model: LLM_Model = None
     chunk_token_size: int = 1000
     chunk_overlap_token_size: int = 100
@@ -22,6 +23,7 @@ class HyperflowConfig:
     diffusion_max_iter: int = 10        # convergence iteration limit
     convergence_tol: float = 1e-4       # L2 norm convergence threshold
     flow_damping: float = 0.5           # hyperedge flow damping rate (0=hard dedup, 1=no damping)
+    semantic_novelty_weight: float = 0.5 # semantic novelty damping strength (0=off, 1=full suppression)
     activation_ratio: float = 0.05      # adaptive threshold: activate entities with score >= top_score * ratio
     use_context_modulation: bool = False # context-modulated incidence matrix
     # Attribute fallback
@@ -29,7 +31,7 @@ class HyperflowConfig:
     attribute_keyword_boost: float = 0.25
     # Reranker
     reranker_model_name: str = "Qwen/Qwen3-Reranker-4B"
-    reranker_candidate_top_k: int = 20
+    reranker_candidate_top_k: int = 30
     reranker_batch_size: int = 2
     reranker_max_length: int = 4096
     reranker_instruction: str = (

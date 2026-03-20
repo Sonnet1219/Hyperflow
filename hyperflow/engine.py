@@ -145,7 +145,8 @@ class Hyperflow:
         for question_info in tqdm(questions, desc="Retrieving"):
             question = question_info["question"]
             question_embedding = self.config.embedding_model.encode(
-                question, normalize_embeddings=True, show_progress_bar=False, batch_size=self.config.batch_size
+                question, normalize_embeddings=True, show_progress_bar=False, batch_size=self.config.batch_size,
+                prompt=self.config.query_instruction_prefix
             )
             _, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores = self.extract_seed_entities(question)
             if len(seed_entities) != 0:
@@ -251,7 +252,8 @@ class Hyperflow:
         if len(question_entities) == 0:
             return [], [], [], [], []
         question_entity_embeddings = self.config.embedding_model.encode(
-            question_entities, normalize_embeddings=True, show_progress_bar=False, batch_size=self.config.batch_size
+            question_entities, normalize_embeddings=True, show_progress_bar=False, batch_size=self.config.batch_size,
+            prompt=self.config.query_instruction_prefix
         )
         similarities = np.dot(self.entity_embeddings, question_entity_embeddings.T)
         seed_entity_indices = []
