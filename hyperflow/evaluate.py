@@ -1,6 +1,6 @@
 import json
 import os
-from src.utils import normalize_answer
+from hyperflow.utils import normalize_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
@@ -15,9 +15,9 @@ class Evaluator:
     def load_predictions(self):
         prediction_results = json.load(open(self.predictions_path))
         return prediction_results
-    
+
     def calculate_llm_accuracy(self,pre_answer,gold_ans):
-        system_prompt = """You are an expert evaluator. 
+        system_prompt = """You are an expert evaluator.
         """
         user_prompt = f"""Please evaluate if the generated answer is correct by comparing it with the gold answer.
         Generated answer: {pre_answer}
@@ -39,7 +39,7 @@ class Evaluator:
 
     def calculate_contain(self,pre_answers,gold_ans):
         if pre_answers is None or pre_answers == "" or (isinstance(pre_answers, str) and pre_answers.strip() == ""):
-            return 0            
+            return 0
         if gold_ans is None or gold_ans == "" or (isinstance(gold_ans, str) and gold_ans.strip() == ""):
             return 0
         s1 = normalize_answer(pre_answers)
@@ -48,11 +48,10 @@ class Evaluator:
             return 1
         else:
             return 0
-            
+
     def evaluate_sig_sample(self,idx,prediction):
         pre_answer = prediction["pred_answer"]
         gold_ans = prediction["gold_answer"]
-        # llm_acc = 0.0
         llm_acc = self.calculate_llm_accuracy(pre_answer, gold_ans)
         contain_acc = self.calculate_contain(pre_answer, gold_ans)
         return idx, llm_acc, contain_acc
@@ -60,10 +59,10 @@ class Evaluator:
     def evaluate(self,max_workers):
         llm_scores = [0.0] * len(self.prediction_results)
         contain_scores = [0.0] * len(self.prediction_results)
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.evaluate_sig_sample, idx, pred): idx 
+                executor.submit(self.evaluate_sig_sample, idx, pred): idx
                 for idx, pred in enumerate(self.prediction_results)
             }
 
@@ -97,7 +96,7 @@ class Evaluator:
         logger.info(f"  Contain Accuracy: {contain_accuracy:.4f} ({sum(contain_scores)}/{len(contain_scores)})")
         with open(self.predictions_path, "w", encoding="utf-8") as f:
             json.dump(self.prediction_results, f, ensure_ascii=False, indent=4)
-        
+
         with open(os.path.join(os.path.dirname(self.predictions_path), "evaluation_results.json"), "w", encoding="utf-8") as f:
             json.dump({"llm_accuracy": llm_accuracy, "contain_accuracy": contain_accuracy}, f, ensure_ascii=False, indent=4)
         return llm_accuracy, contain_accuracy

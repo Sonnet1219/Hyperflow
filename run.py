@@ -1,14 +1,13 @@
 import argparse
 import json
-from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
-from src.config import LinearRAGConfig
-from src.LinearRAG import LinearRAG
+from hyperflow.config import HyperflowConfig
+from hyperflow.engine import Hyperflow
 import os
 import warnings
-from src.evaluate import Evaluator
-from src.utils import LLM_Model
-from src.utils import setup_logging
+from hyperflow.evaluate import Evaluator
+from hyperflow.utils import LLM_Model
+from hyperflow.utils import setup_logging
 from datetime import datetime
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -21,26 +20,23 @@ def parse_arguments():
     parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
     parser.add_argument("--llm_model", type=str, default="gpt-4o-mini", help="The LLM model to use")
     parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
-    parser.add_argument("--max_iterations", type=int, default=3, help="The max number of iterations to use")
-    parser.add_argument("--iteration_threshold", type=float, default=0.4, help="The threshold for iteration")
     parser.add_argument("--passage_ratio", type=float, default=2, help="The ratio for passage")
-    parser.add_argument("--top_k_sentence", type=int, default=3, help="The top k sentence to use")
-    parser.add_argument("--use_vectorized_retrieval", action="store_true", help="Use vectorized matrix-based retrieval instead of BFS iteration")
-    parser.add_argument("--bridge_diversity_weight", type=float, default=0.3, help="Info-theoretic diversity penalty weight for bridge selection (0=pure similarity, 1=full MMR)")
-    parser.add_argument("--use_query_evolution", action="store_true", help="Enable query evolution / semantic steering across hops")
-    parser.add_argument("--query_evolution_inertia", type=float, default=0.7, help="α: retention of original query intent (0=full evolution, 1=no evolution)")
-    parser.add_argument("--query_evolution_steering", type=float, default=0.5, help="γ: bridge sentence steering strength")
-    parser.add_argument("--use_hypergraph_diffusion", action="store_true", help="Use hypergraph spectral diffusion for entity propagation")
-    parser.add_argument("--hypergraph_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
-    parser.add_argument("--hypergraph_max_iterations", type=int, default=10, help="Max iterations for diffusion convergence")
-    parser.add_argument("--hypergraph_convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
-    parser.add_argument("--hypergraph_damping_gamma", type=float, default=0.5, help="Hyperedge flow damping rate (0=hard dedup, 1=no damping)")
-    parser.add_argument("--hypergraph_activation_ratio", type=float, default=0.05, help="Adaptive threshold: activate if score >= top_score * ratio")
+    parser.add_argument("--diffusion_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
+    parser.add_argument("--diffusion_max_iter", type=int, default=10, help="Max iterations for diffusion convergence")
+    parser.add_argument("--convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
+    parser.add_argument("--flow_damping", type=float, default=0.5, help="Hyperedge flow damping rate (0=hard dedup, 1=no damping)")
+    parser.add_argument("--activation_ratio", type=float, default=0.05, help="Adaptive threshold: activate if score >= top_score * ratio")
     parser.add_argument("--use_context_modulation", action="store_true", help="Enable context-modulated incidence matrix")
+    parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B", help="Local or Hub path for the reranker model")
+    parser.add_argument("--reranker_candidate_top_k", type=int, default=20, help="How many retrieval candidates to pass into the reranker")
+    parser.add_argument("--reranker_batch_size", type=int, default=2, help="Batch size for local reranker scoring")
+    parser.add_argument("--reranker_max_length", type=int, default=4096, help="Max token length for reranker inputs")
+    parser.add_argument("--question_limit", type=int, default=None, help="Optional limit for the number of questions to run")
+    parser.add_argument("--skip_evaluation", action="store_true", help="Skip the answer evaluation stage")
     return parser.parse_args()
 
 
-def load_dataset(dataset_name): 
+def load_dataset(dataset_name):
     questions_path = f"dataset/{dataset_name}/questions.json"
     with open(questions_path, "r", encoding="utf-8") as f:
         questions = json.load(f)
@@ -58,40 +54,39 @@ def main():
     time = datetime.now()
     time_str = time.strftime("%Y-%m-%d_%H-%M-%S")
     args = parse_arguments()
+    output_dir = f"results/{args.dataset_name}/{time_str}"
     embedding_model = load_embedding_model(args.embedding_model)
-    questions,passages = load_dataset(args.dataset_name)
-    setup_logging(f"results/{args.dataset_name}/{time_str}/log.txt")
+    questions, passages = load_dataset(args.dataset_name)
+    if args.question_limit is not None:
+        questions = questions[:args.question_limit]
+    setup_logging(f"{output_dir}/log.txt")
     llm_model = LLM_Model(args.llm_model)
-    config = LinearRAGConfig(
+    config = HyperflowConfig(
         dataset_name=args.dataset_name,
         embedding_model=embedding_model,
         spacy_model=args.spacy_model,
         max_workers=args.max_workers,
         llm_model=llm_model,
-        max_iterations=args.max_iterations,
-        iteration_threshold=args.iteration_threshold,
         passage_ratio=args.passage_ratio,
-        top_k_sentence=args.top_k_sentence,
-        use_vectorized_retrieval=args.use_vectorized_retrieval,
-        bridge_diversity_weight=args.bridge_diversity_weight,
-        use_query_evolution=args.use_query_evolution,
-        query_evolution_inertia=args.query_evolution_inertia,
-        query_evolution_steering=args.query_evolution_steering,
-        use_hypergraph_diffusion=args.use_hypergraph_diffusion,
-        hypergraph_alpha=args.hypergraph_alpha,
-        hypergraph_max_iterations=args.hypergraph_max_iterations,
-        hypergraph_convergence_tol=args.hypergraph_convergence_tol,
-        hypergraph_damping_gamma=args.hypergraph_damping_gamma,
-        hypergraph_activation_ratio=args.hypergraph_activation_ratio,
-        use_context_modulation=args.use_context_modulation
+        diffusion_alpha=args.diffusion_alpha,
+        diffusion_max_iter=args.diffusion_max_iter,
+        convergence_tol=args.convergence_tol,
+        flow_damping=args.flow_damping,
+        activation_ratio=args.activation_ratio,
+        use_context_modulation=args.use_context_modulation,
+        reranker_model_name=args.reranker_model,
+        reranker_candidate_top_k=args.reranker_candidate_top_k,
+        reranker_batch_size=args.reranker_batch_size,
+        reranker_max_length=args.reranker_max_length
     )
-    rag_model = LinearRAG(global_config=config)
-    rag_model.index(passages)
-    questions = rag_model.qa(questions)
-    os.makedirs(f"results/{args.dataset_name}/{time_str}", exist_ok=True)
-    with open(f"results/{args.dataset_name}/{time_str}/predictions.json", "w", encoding="utf-8") as f:
+    model = Hyperflow(global_config=config)
+    model.index(passages)
+    questions = model.qa(questions)
+    os.makedirs(output_dir, exist_ok=True)
+    with open(f"{output_dir}/predictions.json", "w", encoding="utf-8") as f:
         json.dump(questions, f, ensure_ascii=False, indent=4)
-    evaluator = Evaluator(llm_model=llm_model, predictions_path=f"results/{args.dataset_name}/{time_str}/predictions.json")
-    evaluator.evaluate(max_workers=args.max_workers)
+    if not args.skip_evaluation:
+        evaluator = Evaluator(llm_model=llm_model, predictions_path=f"{output_dir}/predictions.json")
+        evaluator.evaluate(max_workers=args.max_workers)
 if __name__ == "__main__":
     main()

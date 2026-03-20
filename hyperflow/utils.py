@@ -37,7 +37,7 @@ def normalize_answer(s):
     if s is None:
         return ""
     if not isinstance(s, str):
-        s = str(s) 
+        s = str(s)
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
     def white_space_fix(text):
@@ -51,7 +51,7 @@ def normalize_answer(s):
 
 def setup_logging(log_file):
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
-    handlers = [logging.StreamHandler()]  
+    handlers = [logging.StreamHandler()]
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     handlers.append(logging.FileHandler(log_file, mode='a', encoding='utf-8'))
     logging.basicConfig(
@@ -60,7 +60,6 @@ def setup_logging(log_file):
         handlers=handlers,
         force=True
     )
-    # Suppress noisy HTTP request logs (e.g., 401 Unauthorized) from httpx/openai
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
@@ -69,9 +68,8 @@ def min_max_normalize(x):
     min_val = np.min(x)
     max_val = np.max(x)
     range_val = max_val - min_val
-    
-    # Handle the case where all values are the same (range is zero)
+
     if range_val == 0:
-        return np.ones_like(x)  # Return an array of ones with the same shape as x
-    
+        return np.ones_like(x)
+
     return (x - min_val) / range_val

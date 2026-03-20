@@ -1,15 +1,26 @@
-import spacy
+import logging
 from collections import defaultdict
-import pdb
+
+import spacy
+
+
+logger = logging.getLogger(__name__)
 
 
 class SpacyNER:
     def __init__(self,spacy_model):
         self.spacy_model = spacy.load(spacy_model)
+        logger.info("spaCy NER loaded with model: %s", spacy_model)
 
     def batch_ner(self, hash_id_to_passage, max_workers):
         passage_list = list(hash_id_to_passage.values())
-        batch_size = len(passage_list) // max_workers
+        batch_size = max(1, len(passage_list) // max_workers)
+        logger.info(
+            "Running spaCy NER on %s passages with batch_size=%s and max_workers=%s",
+            len(passage_list),
+            batch_size,
+            max_workers,
+        )
         docs_list = self.spacy_model.pipe(passage_list,batch_size=batch_size)
         passage_hash_id_to_entities = {}
         sentence_to_entities = defaultdict(list)
@@ -22,12 +33,11 @@ class SpacyNER:
                     if e not in sentence_to_entities[sent]:
                         sentence_to_entities[sent].append(e)
         return passage_hash_id_to_entities,sentence_to_entities
-            
+
     def extract_entities_sentences(self, doc,passage_hash_id):
         sentence_to_entities = defaultdict(list)
         unique_entities = set()
         passage_hash_id_to_entities = {}
-        # pdb.set_trace()  # 注释掉调试断点
         for ent in doc.ents:
             if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
                 continue

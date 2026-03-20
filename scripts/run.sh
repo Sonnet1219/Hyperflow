@@ -1,15 +1,4 @@
-cd /mnt/data/lyzhuang/linear-rag
-
-# medical
-# SPACY_MODEL="en_core_sci_scibert"
-# EMBEDDING_MODEL="model/all-mpnet-base-v2"
-# DATASET="medical"
-# LLM_MODEL="gpt-4o-mini"
-# MAX_WORKERS=16
-# MAX_ITERATION=3
-# PASSAGE_RATIO=1.5
-# THRESHOLD=0.5
-# TOP_K_SENTENCE=1
+cd /mnt/data/lyzhuang/hyperflow
 
 # musique
 # SPACY_MODEL="en_core_web_trf"
@@ -17,10 +6,11 @@ cd /mnt/data/lyzhuang/linear-rag
 # DATASET="musique"
 # LLM_MODEL="gpt-4o-mini"
 # MAX_WORKERS=16
-# MAX_ITERATION=5
 # PASSAGE_RATIO=2.0
-# THRESHOLD=0.1
-# TOP_K_SENTENCE=4
+# DIFFUSION_ALPHA=0.85
+# DIFFUSION_MAX_ITER=10
+# FLOW_DAMPING=0.5
+# ACTIVATION_RATIO=0.05
 
 # 2wikimultihop
 # SPACY_MODEL="en_core_web_trf"
@@ -28,10 +18,11 @@ cd /mnt/data/lyzhuang/linear-rag
 # DATASET="2wikimultihop"
 # LLM_MODEL="gpt-4o-mini"
 # MAX_WORKERS=16
-# MAX_ITERATION=3
 # PASSAGE_RATIO=0.05
-# THRESHOLD=0.4
-# TOP_K_SENTENCE=1
+# DIFFUSION_ALPHA=0.85
+# DIFFUSION_MAX_ITER=10
+# FLOW_DAMPING=0.5
+# ACTIVATION_RATIO=0.05
 
 # hotpotqa
 # SPACY_MODEL="en_core_web_trf"
@@ -39,10 +30,11 @@ cd /mnt/data/lyzhuang/linear-rag
 # DATASET="hotpotqa"
 # LLM_MODEL="gpt-4o-mini"
 # MAX_WORKERS=16
-# MAX_ITERATION=3
 # PASSAGE_RATIO=0.05
-# THRESHOLD=0.4
-# TOP_K_SENTENCE=1
+# DIFFUSION_ALPHA=0.85
+# DIFFUSION_MAX_ITER=10
+# FLOW_DAMPING=0.5
+# ACTIVATION_RATIO=0.05
 
 
 
@@ -52,7 +44,8 @@ python run.py \
     --dataset_name ${DATASET} \
     --llm_model ${LLM_MODEL} \
     --max_workers ${MAX_WORKERS} \
-    --max_iterations ${MAX_ITERATION} \
-    --iteration_threshold ${THRESHOLD} \
     --passage_ratio ${PASSAGE_RATIO} \
-    --top_k_sentence ${TOP_K_SENTENCE}
+    --diffusion_alpha ${DIFFUSION_ALPHA} \
+    --diffusion_max_iter ${DIFFUSION_MAX_ITER} \
+    --flow_damping ${FLOW_DAMPING} \
+    --activation_ratio ${ACTIVATION_RATIO}
