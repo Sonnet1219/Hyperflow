@@ -24,13 +24,11 @@ def parse_arguments():
     parser.add_argument("--diffusion_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
     parser.add_argument("--diffusion_max_iter", type=int, default=10, help="Max iterations for diffusion convergence")
     parser.add_argument("--convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
-    parser.add_argument("--flow_damping", type=float, default=0.5, help="Hyperedge flow damping rate (0=hard dedup, 1=no damping)")
-    parser.add_argument("--activation_ratio", type=float, default=0.05, help="Adaptive threshold: activate if score >= top_score * ratio")
-    parser.add_argument("--semantic_novelty_weight", type=float, default=0.5, help="Semantic novelty damping strength (0=off, 1=full suppression)")
-    parser.add_argument("--use_context_modulation", action="store_true", help="Enable context-modulated incidence matrix")
+    parser.add_argument("--sentence_gate_threshold", type=float, default=0.5, help="Block sentences with query-similarity below this threshold")
+    parser.add_argument("--diffusion_top_k", type=int, default=10, help="Activate top-K entities per diffusion round")
     parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B", help="Local or Hub path for the reranker model")
     parser.add_argument("--reranker_candidate_top_k", type=int, default=30, help="How many retrieval candidates to pass into the reranker")
-    parser.add_argument("--reranker_batch_size", type=int, default=2, help="Batch size for reranker scoring")
+    parser.add_argument("--reranker_batch_size", type=int, default=16, help="Batch size for reranker scoring")
     parser.add_argument("--reranker_max_length", type=int, default=4096, help="Max token length for reranker inputs")
     parser.add_argument("--question_limit", type=int, default=None, help="Optional limit for the number of questions to run")
     parser.add_argument("--skip_evaluation", action="store_true", help="Skip the answer evaluation stage")
@@ -72,10 +70,8 @@ def main():
         diffusion_alpha=args.diffusion_alpha,
         diffusion_max_iter=args.diffusion_max_iter,
         convergence_tol=args.convergence_tol,
-        flow_damping=args.flow_damping,
-        semantic_novelty_weight=args.semantic_novelty_weight,
-        activation_ratio=args.activation_ratio,
-        use_context_modulation=args.use_context_modulation,
+        sentence_gate_threshold=args.sentence_gate_threshold,
+        diffusion_top_k=args.diffusion_top_k,
         reranker_model_name=args.reranker_model,
         reranker_candidate_top_k=args.reranker_candidate_top_k,
         reranker_batch_size=args.reranker_batch_size,

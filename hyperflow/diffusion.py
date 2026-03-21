@@ -78,42 +78,23 @@ def compute_degree_vectors(H, device):
     return d_v_inv_sqrt, d_e_inv
 
 
-def build_context_aware_incidence(H, entity_embeddings, sentence_embeddings, query_embedding, device):
-    """Build context-modulated incidence matrix: H_ctx[v,e] = cos_sim(entity_v * sentence_e, query)."""
-    H_coalesced = H.coalesce()
-    indices = H_coalesced.indices()
-    entity_indices = indices[0].cpu().numpy()
-    sentence_indices = indices[1].cpu().numpy()
-
-    entity_embs = entity_embeddings[entity_indices]
-    sentence_embs = sentence_embeddings[sentence_indices]
-    context_embs = entity_embs * sentence_embs                    # Hadamard product
-
-    norms = np.linalg.norm(context_embs, axis=1, keepdims=True)
-    context_embs = context_embs / np.maximum(norms, 1e-8)
-    query_emb = query_embedding.reshape(-1, 1) if len(query_embedding.shape) == 1 else query_embedding
-    sims = np.dot(context_embs, query_emb).flatten()
-    sims = np.maximum(sims, 0.0)
-
-    values = torch.from_numpy(sims.astype(np.float32)).to(device)
-    return torch.sparse_coo_tensor(indices, values, H_coalesced.shape, device=device).coalesce()
-
-
 def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, sentence_embeddings,
                               question_embedding, seed_entity_indices, seed_entity_hash_ids,
                               seed_entity_scores, entity_to_sentence_sparse, node_name_to_vertex_idx,
                               d_v_inv_sqrt, d_e_inv, graph_node_count, device):
     """
-    Hypergraph spectral diffusion with flow damping and adaptive activation.
+    Wavefront hypergraph spectral diffusion.
 
-    Operator: Theta = D_v^{-1/2} H W_q^{(t)} D_e^{-1} H^T D_v^{-1/2}
+    Operator: Theta = D_v^{-1/2} H G D_e^{-1} H^T D_v^{-1/2}
     Update:   f^{t+1} = alpha * Theta @ f^{t} + (1-alpha) * f^{0}
-    Flow damping: W_q^{(t)} = W_q * gamma^flow_cumulative
-    Activation: adaptive threshold = top_score * activation_ratio
+    Gate G:   binary mask — block sentences with query-similarity below threshold
+    Wavefront: each round keeps only top-K entities and re-normalizes,
+               so the frontier advances K entities at a time.
     """
     num_entities = len(entity_hash_ids)
     num_sentences = entity_to_sentence_sparse.shape[1]
     entity_weights = np.zeros(graph_node_count)
+    top_k = config.diffusion_top_k
 
     # Phase A: Initialize f^(0) from seed entities
     f0 = torch.zeros(num_entities, device=device)
@@ -123,99 +104,67 @@ def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, senten
     if f0_norm > 0:
         f0 = f0 / f0_norm
 
-    # Phase B: Query-adaptive hyperedge weights W_q
+    # Phase B: Sentence gate — block sentences with low query-similarity
     question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
     sentence_sims = np.dot(sentence_embeddings, question_emb).flatten()
     w_q = torch.from_numpy(sentence_sims).float().to(device).clamp(min=0)
+    gate_mask = (w_q >= config.sentence_gate_threshold).float()
+    num_pass = int(gate_mask.sum().item())
+    logger.info(f"Sentence gate (threshold={config.sentence_gate_threshold}): "
+                f"{num_pass}/{num_sentences} pass, {num_sentences - num_pass} blocked")
 
-    # Phase C: Select H and degree matrices (context modulation or binary)
-    if config.use_context_modulation:
-        H = build_context_aware_incidence(entity_to_sentence_sparse, entity_embeddings,
-                                          sentence_embeddings, question_embedding, device)
-        H_T = H.t()
-        d_v = torch.sparse.mm(H, torch.ones(H.shape[1], 1, device=device)).squeeze()
-        d_e = torch.sparse.mm(H_T, torch.ones(H.shape[0], 1, device=device)).squeeze()
-        d_v_inv_sqrt_local = torch.where(d_v > 0, d_v.pow(-0.5), torch.zeros_like(d_v))
-        d_e_inv_local = torch.where(d_e > 0, d_e.pow(-1.0), torch.zeros_like(d_e))
-    else:
-        H = entity_to_sentence_sparse
-        H_T = H.t()
-        d_v_inv_sqrt_local = d_v_inv_sqrt
-        d_e_inv_local = d_e_inv
+    H = entity_to_sentence_sparse
+    H_T = H.t()
 
-    # Phase D: Iterative spectral diffusion with flow damping + semantic novelty damping
+    # Phase C: Wavefront diffusion
     alpha = config.diffusion_alpha
-    gamma = config.flow_damping
-    beta = config.semantic_novelty_weight
     f = f0.clone()
-    flow_cumulative = torch.zeros(num_sentences, device=device)
-
-    # Precompute normalized sentence embeddings on GPU for novelty computation
-    if beta > 0:
-        sent_emb_tensor = torch.from_numpy(sentence_embeddings).float().to(device)  # (S, D)
-        sent_emb_norms = sent_emb_tensor.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        sent_emb_normed = sent_emb_tensor / sent_emb_norms                          # (S, D)
+    activated_indices = set()
 
     for t in range(config.diffusion_max_iter):
-        # Flow damping: penalize overused individual hyperedges
-        w_q_damped = w_q * (gamma ** flow_cumulative)
-
-        # Semantic novelty damping: penalize sentences similar to already-explored direction
-        if beta > 0 and t > 0 and flow_cumulative.sum() > 0:
-            # Explored centroid = flow-weighted average of sentence embeddings
-            weights_for_centroid = flow_cumulative.unsqueeze(1)                      # (S, 1)
-            explored_centroid = (weights_for_centroid * sent_emb_tensor).sum(dim=0)  # (D,)
-            centroid_norm = explored_centroid.norm().clamp(min=1e-8)
-            explored_centroid = explored_centroid / centroid_norm                     # (D,)
-
-            # Redundancy = cosine similarity to explored centroid
-            redundancy = torch.mv(sent_emb_normed, explored_centroid).clamp(min=0)   # (S,)
-
-            # Novelty factor: suppress sentences aligned with explored territory
-            novelty = 1.0 - beta * redundancy                                        # (S,)
-            w_q_final = w_q_damped * novelty
-        else:
-            w_q_final = w_q_damped
-
-        step1 = d_v_inv_sqrt_local * f                                          # D_v^{-1/2} @ f
-        step2 = torch.sparse.mm(H_T, step1.unsqueeze(1)).squeeze(1)            # H^T @ step1
-        step3 = d_e_inv_local * step2                                           # D_e^{-1} @ step2
-        step4 = w_q_final * step3                                               # W_q^{(t)} @ step3
-        step5 = torch.sparse.mm(H, step4.unsqueeze(1)).squeeze(1)              # H @ step4
-        theta_f = d_v_inv_sqrt_local * step5                                    # D_v^{-1/2} @ step5
+        step1 = d_v_inv_sqrt * f
+        step2 = torch.sparse.mm(H_T, step1.unsqueeze(1)).squeeze(1)
+        step3 = d_e_inv * step2
+        step4 = gate_mask * step3
+        step5 = torch.sparse.mm(H, step4.unsqueeze(1)).squeeze(1)
+        theta_f = d_v_inv_sqrt * step5
 
         f_new = alpha * theta_f + (1 - alpha) * f0
-
-        flow_cumulative += step4.abs()
-
         delta = (f_new - f).norm().item()
-        f = f_new
+
+        # Wavefront: keep top-K, zero rest, re-normalize
+        top_indices = torch.topk(f_new, min(top_k, num_entities)).indices
+        activated_indices.update(top_indices.cpu().tolist())
+        mask = torch.zeros(num_entities, device=device)
+        mask[top_indices] = 1.0
+        f = f_new * mask
+        f_norm = f.norm()
+        if f_norm > 0:
+            f = f / f_norm
+
         if delta < config.convergence_tol:
-            logger.debug(f"Spectral diffusion converged at iteration {t+1} (delta={delta:.6f})")
+            logger.debug(f"Wavefront diffusion converged at iteration {t+1} (delta={delta:.6f})")
             break
 
-    # Phase E: Convert to entity_weights and actived_entities
-    if f0_norm > 0:
-        f = f * f0_norm
-    entity_scores_np = f.cpu().numpy()
-
-    top_score = entity_scores_np.max()
-    adaptive_threshold = top_score * config.activation_ratio
-
+    # Phase D: Collect activated entities (seeds + all wavefront discoveries)
     actived_entities = {}
     for idx, hash_id, score in zip(seed_entity_indices, seed_entity_hash_ids, seed_entity_scores):
         actived_entities[hash_id] = (idx, score, 1)
         if hash_id in node_name_to_vertex_idx:
-            node_idx = node_name_to_vertex_idx[hash_id]
-            entity_weights[node_idx] = score
+            entity_weights[node_name_to_vertex_idx[hash_id]] = score
 
-    for entity_idx in range(num_entities):
-        score = entity_scores_np[entity_idx]
-        if score >= adaptive_threshold:
-            hash_id = entity_hash_ids[entity_idx]
-            if hash_id in node_name_to_vertex_idx:
-                node_idx = node_name_to_vertex_idx[hash_id]
-                entity_weights[node_idx] = max(entity_weights[node_idx], float(score))
-                if hash_id not in actived_entities:
-                    actived_entities[hash_id] = (entity_idx, float(score), 1)
+    if f0_norm > 0:
+        final_scores = (f * f0_norm).cpu().numpy()
+    else:
+        final_scores = f.cpu().numpy()
+
+    for entity_idx in activated_indices:
+        hash_id = entity_hash_ids[entity_idx]
+        if hash_id not in actived_entities:
+            score = max(float(final_scores[entity_idx]), 0.01)
+            actived_entities[hash_id] = (entity_idx, score, 1)
+        if hash_id in node_name_to_vertex_idx:
+            node_idx = node_name_to_vertex_idx[hash_id]
+            entity_weights[node_idx] = max(entity_weights[node_idx], float(final_scores[entity_idx]))
+
     return entity_weights, actived_entities

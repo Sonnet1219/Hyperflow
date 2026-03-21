@@ -28,8 +28,12 @@ class LLM_Model:
             "temperature": 0,
         }
     def infer(self, messages):
-        response = self.openai_client.chat.completions.create(**self.llm_config,messages=messages)
-        return response.choices[0].message.content
+        try:
+            response = self.openai_client.chat.completions.create(**self.llm_config,messages=messages)
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.getLogger(__name__).warning("LLM infer failed: %s", e)
+            return ""
 
 
 

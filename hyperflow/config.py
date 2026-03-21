@@ -22,17 +22,15 @@ class HyperflowConfig:
     diffusion_alpha: float = 0.85       # diffusion weight (higher = more exploration, less teleport)
     diffusion_max_iter: int = 10        # convergence iteration limit
     convergence_tol: float = 1e-4       # L2 norm convergence threshold
-    flow_damping: float = 0.5           # hyperedge flow damping rate (0=hard dedup, 1=no damping)
-    semantic_novelty_weight: float = 0.5 # semantic novelty damping strength (0=off, 1=full suppression)
-    activation_ratio: float = 0.05      # adaptive threshold: activate entities with score >= top_score * ratio
-    use_context_modulation: bool = False # context-modulated incidence matrix
+    sentence_gate_threshold: float = 0.5  # block sentences with query-similarity below this
+    diffusion_top_k: int = 10           # activate top-K entities per diffusion round
     # Attribute fallback
     enable_hybrid_attribute_fallback: bool = False
     attribute_keyword_boost: float = 0.25
     # Reranker
     reranker_model_name: str = "Qwen/Qwen3-Reranker-4B"
     reranker_candidate_top_k: int = 30
-    reranker_batch_size: int = 2
+    reranker_batch_size: int = 8
     reranker_max_length: int = 4096
     reranker_instruction: str = (
         "Given a multi-hop question, judge whether the document contains evidence "
