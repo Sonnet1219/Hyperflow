@@ -1,0 +1,281 @@
+"""Entry point for GraphRAG-Bench benchmark evaluation.
+
+Pipeline:
+  1. Load corpus & questions from local HuggingFace cache
+  2. Chunk corpus -> Build hypergraph index
+  3. Retrieve + QA for each question
+  4. Save predictions in official unified JSON format
+  5. Run official Evaluation scripts (generation_eval + retrieval_eval)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import warnings
+from datetime import datetime
+
+from sentence_transformers import SentenceTransformer
+from hyperflow.config import HyperflowConfig, get_gliner_labels_for_corpus
+from hyperflow.engine import Hyperflow
+from hyperflow.bench import load_corpus, load_questions, format_results
+from hyperflow.chunker import chunk_corpus_by_tokens
+from hyperflow.utils import LLM_Model, setup_logging
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+warnings.filterwarnings("ignore")
+
+# Path to the cloned official GraphRAG-Benchmark repo
+EVAL_REPO_DIR = os.path.expanduser("~/GraphRAG-Benchmark")
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Run Hyperflow on GraphRAG-Bench",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- Corpus ---
+    parser.add_argument("--corpus_name", type=str, default="medical",
+                        choices=["medical", "novel"], help="Which corpus to use")
+
+    # --- Models ---
+    parser.add_argument("--embedding_model", type=str, default="BAAI/bge-large-en-v1.5")
+    parser.add_argument("--llm_model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--spacy_model", type=str, default="en_core_web_trf")
+
+    # --- NER ---
+    parser.add_argument("--ner_backend", type=str, default="gliner",
+                        choices=["gliner", "spacy"], help="NER backend")
+    parser.add_argument("--gliner_model", type=str, default="urchade/gliner_large-v2.1")
+    parser.add_argument("--gliner_threshold", type=float, default=0.3)
+
+    # --- Chunking ---
+    parser.add_argument("--chunk_size", type=int, default=1200, help="Token size for corpus chunking")
+    parser.add_argument("--chunk_overlap", type=int, default=100, help="Token overlap between chunks")
+    parser.add_argument("--semantic_unit_percentile", type=int, default=80,
+                        help="Kamradt percentile for semantic unit boundary detection")
+
+    # --- Retrieval ---
+    parser.add_argument("--max_workers", type=int, default=16)
+    parser.add_argument("--passage_ratio", type=float, default=2)
+    parser.add_argument("--diffusion_alpha", type=float, default=0.85)
+    parser.add_argument("--diffusion_max_iter", type=int, default=10)
+    parser.add_argument("--convergence_tol", type=float, default=1e-4)
+    parser.add_argument("--semantic_unit_gate_threshold", type=float, default=0.5)
+    parser.add_argument("--diffusion_top_k", type=int, default=10)
+
+    # --- Reranker ---
+    parser.add_argument("--no_rerank", action="store_true",
+                        help="Disable reranking (use diffusion/PPR scores directly)")
+    parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B")
+    parser.add_argument("--reranker_candidate_top_k", type=int, default=30)
+    parser.add_argument("--reranker_batch_size", type=int, default=16)
+    parser.add_argument("--reranker_max_length", type=int, default=4096)
+
+    # --- Question limit ---
+    parser.add_argument("--question_limit", type=int, default=None,
+                        help="Limit number of questions (for testing)")
+
+    # --- Pipeline control ---
+    parser.add_argument("--skip_qa", action="store_true",
+                        help="Skip QA generation (only do indexing)")
+    parser.add_argument("--skip_eval", action="store_true",
+                        help="Skip official evaluation (only generate predictions)")
+
+    # --- Evaluation settings ---
+    parser.add_argument("--eval_mode", type=str, default="API",
+                        choices=["API", "ollama"], help="Evaluation LLM mode")
+    parser.add_argument("--eval_model", type=str, default=None,
+                        help="LLM for evaluation (defaults to --llm_model)")
+    parser.add_argument("--eval_base_url", type=str, default=None,
+                        help="Base URL for evaluation LLM (defaults to OPENAI_BASE_URL)")
+    parser.add_argument("--eval_embedding_model", type=str, default="BAAI/bge-large-en-v1.5",
+                        help="Embedding model for evaluation")
+    parser.add_argument("--eval_num_samples", type=int, default=None,
+                        help="Limit samples per question type for evaluation")
+
+    return parser.parse_args()
+
+
+def run_official_eval(predictions_path: str, output_dir: str, args):
+    """Run official GraphRAG-Benchmark evaluation scripts."""
+    eval_model = args.eval_model or args.llm_model
+    eval_base_url = args.eval_base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    # Set LLM_API_KEY for official eval (it reads this env var)
+    eval_env = os.environ.copy()
+    eval_env["LLM_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+    # Ensure the Evaluation package is importable
+    eval_env["PYTHONPATH"] = EVAL_REPO_DIR + os.pathsep + eval_env.get("PYTHONPATH", "")
+
+    gen_output = os.path.abspath(os.path.join(output_dir, "generation_eval.json"))
+    ret_output = os.path.abspath(os.path.join(output_dir, "retrieval_eval.json"))
+
+    base_cmd = [
+        sys.executable, "-m",
+    ]
+
+    gen_cmd = base_cmd + [
+        "Evaluation.generation_eval",
+        "--mode", args.eval_mode,
+        "--model", eval_model,
+        "--base_url", eval_base_url,
+        "--embedding_model", args.eval_embedding_model,
+        "--data_file", predictions_path,
+        "--output_file", gen_output,
+        "--detailed_output",
+    ]
+
+    ret_cmd = base_cmd + [
+        "Evaluation.retrieval_eval",
+        "--mode", args.eval_mode,
+        "--model", eval_model,
+        "--base_url", eval_base_url,
+        "--embedding_model", args.eval_embedding_model,
+        "--data_file", predictions_path,
+        "--output_file", ret_output,
+        "--detailed_output",
+    ]
+
+    if args.eval_num_samples:
+        gen_cmd += ["--num_samples", str(args.eval_num_samples)]
+        ret_cmd += ["--num_samples", str(args.eval_num_samples)]
+
+    # Run from the official repo directory so imports resolve
+    print("\n" + "=" * 60)
+    print("Running official generation evaluation...")
+    print("=" * 60)
+    result = subprocess.run(gen_cmd, cwd=EVAL_REPO_DIR, env=eval_env,
+                            capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(f"WARNING: generation_eval exited with code {result.returncode}")
+        print(result.stderr[-1000:] if result.stderr else "")
+
+    print("\n" + "=" * 60)
+    print("Running official retrieval evaluation...")
+    print("=" * 60)
+    result = subprocess.run(ret_cmd, cwd=EVAL_REPO_DIR, env=eval_env,
+                            capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(f"WARNING: retrieval_eval exited with code {result.returncode}")
+        print(result.stderr[-1000:] if result.stderr else "")
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("EVALUATION SUMMARY")
+    print("=" * 60)
+    for label, path in [("Generation", gen_output), ("Retrieval", ret_output)]:
+        if os.path.exists(path):
+            with open(path) as f:
+                results = json.load(f)
+            print(f"\n--- {label} Metrics ---")
+            for qtype, metrics in results.items():
+                scores = metrics.get("average_scores", metrics)
+                print(f"  {qtype}:")
+                for metric, score in scores.items():
+                    if isinstance(score, float):
+                        print(f"    {metric}: {score:.4f}")
+                    else:
+                        print(f"    {metric}: {score}")
+        else:
+            print(f"\n--- {label}: results file not found ---")
+
+
+def main():
+    time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    args = parse_arguments()
+    output_dir = f"results/graphrag-bench/{args.corpus_name}/{time_str}"
+    os.makedirs(output_dir, exist_ok=True)
+    setup_logging(f"{output_dir}/log.txt")
+
+    # Load embedding model
+    embedding_model = SentenceTransformer(args.embedding_model, device="cuda")
+
+    # Load corpus and chunk it
+    corpus_text = load_corpus(args.corpus_name)
+    chunks = chunk_corpus_by_tokens(corpus_text, args.chunk_size, args.chunk_overlap)
+    passages = [f"{idx}:{chunk}" for idx, chunk in enumerate(chunks)]
+    print(f"Corpus chunked into {len(passages)} passages "
+          f"({args.chunk_size} tokens, {args.chunk_overlap} overlap)")
+
+    # Load questions
+    questions = load_questions(args.corpus_name)
+    if args.question_limit is not None:
+        questions = questions[:args.question_limit]
+    print(f"Loaded {len(questions)} questions")
+
+    # Set up GLiNER labels based on corpus
+    gliner_labels = get_gliner_labels_for_corpus(args.corpus_name)
+
+    # Create config
+    llm_model = LLM_Model(args.llm_model)
+    config = HyperflowConfig(
+        dataset_name=f"graphrag-bench-{args.corpus_name}",
+        embedding_model=embedding_model,
+        spacy_model=args.spacy_model,
+        max_workers=args.max_workers,
+        llm_model=llm_model,
+        chunk_token_size=args.chunk_size,
+        chunk_overlap_token_size=args.chunk_overlap,
+        passage_ratio=args.passage_ratio,
+        diffusion_alpha=args.diffusion_alpha,
+        diffusion_max_iter=args.diffusion_max_iter,
+        convergence_tol=args.convergence_tol,
+        semantic_unit_gate_threshold=args.semantic_unit_gate_threshold,
+        semantic_unit_percentile=args.semantic_unit_percentile,
+        diffusion_top_k=args.diffusion_top_k,
+        use_reranker=not args.no_rerank,
+        reranker_model_name=args.reranker_model,
+        reranker_candidate_top_k=args.reranker_candidate_top_k,
+        reranker_batch_size=args.reranker_batch_size,
+        reranker_max_length=args.reranker_max_length,
+        ner_backend=args.ner_backend,
+        gliner_model=args.gliner_model,
+        gliner_threshold=args.gliner_threshold,
+        gliner_labels=gliner_labels,
+    )
+
+    # Index
+    model = Hyperflow(global_config=config)
+    model.index(passages)
+    print("Indexing complete.")
+
+    if args.skip_qa:
+        print("Skipping QA generation (--skip_qa). Done.")
+        return
+
+    # QA
+    results = model.qa(questions)
+
+    # Format and save in official GraphRAG-Bench unified format
+    formatted = format_results(results, questions)
+    predictions_path = os.path.join(output_dir, "predictions.json")
+    with open(predictions_path, "w", encoding="utf-8") as f:
+        json.dump(formatted, f, ensure_ascii=False, indent=2)
+    print(f"Predictions saved to {predictions_path}")
+
+    # Free GPU memory before evaluation (eval loads its own embedding model)
+    import gc
+    del model
+    gc.collect()
+    import torch
+    torch.cuda.empty_cache()
+
+    # Run official evaluation
+    if not args.skip_eval:
+        if not os.path.isdir(EVAL_REPO_DIR):
+            print(f"WARNING: Official eval repo not found at {EVAL_REPO_DIR}")
+            print("Clone it: git clone https://github.com/GraphRAG-Bench/GraphRAG-Benchmark.git ~/GraphRAG-Benchmark")
+            print("Skipping evaluation.")
+        else:
+            run_official_eval(os.path.abspath(predictions_path), output_dir, args)
+    else:
+        print("Skipping evaluation (--skip_eval).")
+
+
+if __name__ == "__main__":
+    main()

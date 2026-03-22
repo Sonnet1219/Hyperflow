@@ -33,22 +33,10 @@ class QwenReranker:
 
         model_kwargs = {
             "dtype": torch.bfloat16 if self.device.type == "cuda" else torch.float32,
+            "attn_implementation": "sdpa",
         }
-        if self.device.type == "cuda" and importlib.util.find_spec("flash_attn") is not None:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
 
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
-        except Exception as exc:
-            if model_kwargs.get("attn_implementation") != "flash_attention_2":
-                raise
-            logger.warning(
-                "flash_attention_2 load failed for %s (%s). Falling back to default attention.",
-                self.model_name,
-                exc,
-            )
-            model_kwargs.pop("attn_implementation", None)
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
 
         self.model.to(self.device)
         self.model.eval()
@@ -104,10 +92,14 @@ class QwenReranker:
             batch_documents = documents[start:start + self.batch_size]
             batch_pairs = [(query, document) for document in batch_documents]
             inputs = self._prepare_inputs(batch_pairs)
-            batch_logits = self.model(**inputs).logits[:, -1, :]
-            false_logits = batch_logits[:, self.token_false_id]
-            true_logits = batch_logits[:, self.token_true_id]
+            # Only compute logits for the last token to save memory
+            outputs = self.model(**inputs)
+            last_logits = outputs.logits[:, -1, :]
+            true_logits = last_logits[:, self.token_true_id]
+            false_logits = last_logits[:, self.token_false_id]
             pair_logits = torch.stack([false_logits, true_logits], dim=1)
             batch_scores = torch.softmax(pair_logits, dim=1)[:, 1]
             all_scores.extend(batch_scores.float().cpu().tolist())
+            del outputs, last_logits, inputs
+            torch.cuda.empty_cache()
         return all_scores

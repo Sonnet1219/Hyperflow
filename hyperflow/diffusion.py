@@ -7,59 +7,59 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build_incidence_matrix(entity_hash_id_to_sentence_hash_ids, sentence_hash_id_to_entity_hash_ids,
-                           entity_embedding_store, sentence_embedding_store, device):
+def build_incidence_matrix(entity_hash_id_to_su_hash_ids, su_hash_id_to_entity_hash_ids,
+                           entity_embedding_store, su_embedding_store, device):
     """
-    Build sparse incidence matrices H (entity-to-sentence) and S2E (sentence-to-entity)
+    Build sparse incidence matrices H (entity-to-semantic-unit) and S2E (semantic-unit-to-entity)
     using PyTorch COO tensors. Called once per retrieve() session.
     """
     entity_hash_ids = list(entity_embedding_store.hash_id_to_text.keys())
-    sentence_hash_ids = list(sentence_embedding_store.hash_id_to_text.keys())
+    su_hash_ids = list(su_embedding_store.hash_id_to_text.keys())
     num_entities = len(entity_hash_ids)
-    num_sentences = len(sentence_hash_ids)
+    num_sus = len(su_hash_ids)
 
-    # Entity-to-sentence (incidence matrix H)
+    # Entity-to-semantic-unit (incidence matrix H)
     e2s_indices = []
     e2s_values = []
-    for entity_hash_id, sent_hash_ids in entity_hash_id_to_sentence_hash_ids.items():
+    for entity_hash_id, s_hash_ids in entity_hash_id_to_su_hash_ids.items():
         entity_idx = entity_embedding_store.hash_id_to_idx[entity_hash_id]
-        for sent_hash_id in sent_hash_ids:
-            sentence_idx = sentence_embedding_store.hash_id_to_idx[sent_hash_id]
-            e2s_indices.append([entity_idx, sentence_idx])
+        for su_hash_id in s_hash_ids:
+            su_idx = su_embedding_store.hash_id_to_idx[su_hash_id]
+            e2s_indices.append([entity_idx, su_idx])
             e2s_values.append(1.0)
 
-    # Sentence-to-entity (transpose direction)
+    # Semantic-unit-to-entity (transpose direction)
     s2e_indices = []
     s2e_values = []
-    for sent_hash_id, ent_hash_ids in sentence_hash_id_to_entity_hash_ids.items():
-        sentence_idx = sentence_embedding_store.hash_id_to_idx[sent_hash_id]
+    for su_hash_id, ent_hash_ids in su_hash_id_to_entity_hash_ids.items():
+        su_idx = su_embedding_store.hash_id_to_idx[su_hash_id]
         for entity_hash_id in ent_hash_ids:
             entity_idx = entity_embedding_store.hash_id_to_idx[entity_hash_id]
-            s2e_indices.append([sentence_idx, entity_idx])
+            s2e_indices.append([su_idx, entity_idx])
             s2e_values.append(1.0)
 
     if len(e2s_indices) > 0:
         idx_tensor = torch.tensor(e2s_indices, dtype=torch.long).t()
         val_tensor = torch.tensor(e2s_values, dtype=torch.float32)
         e2s_sparse = torch.sparse_coo_tensor(
-            idx_tensor, val_tensor, (num_entities, num_sentences), device=device
+            idx_tensor, val_tensor, (num_entities, num_sus), device=device
         ).coalesce()
     else:
         e2s_sparse = torch.sparse_coo_tensor(
             torch.zeros((2, 0), dtype=torch.long), torch.zeros(0, dtype=torch.float32),
-            (num_entities, num_sentences), device=device
+            (num_entities, num_sus), device=device
         )
 
     if len(s2e_indices) > 0:
         idx_tensor = torch.tensor(s2e_indices, dtype=torch.long).t()
         val_tensor = torch.tensor(s2e_values, dtype=torch.float32)
         s2e_sparse = torch.sparse_coo_tensor(
-            idx_tensor, val_tensor, (num_sentences, num_entities), device=device
+            idx_tensor, val_tensor, (num_sus, num_entities), device=device
         ).coalesce()
     else:
         s2e_sparse = torch.sparse_coo_tensor(
             torch.zeros((2, 0), dtype=torch.long), torch.zeros(0, dtype=torch.float32),
-            (num_sentences, num_entities), device=device
+            (num_sus, num_entities), device=device
         )
 
     return e2s_sparse, s2e_sparse
@@ -78,21 +78,21 @@ def compute_degree_vectors(H, device):
     return d_v_inv_sqrt, d_e_inv
 
 
-def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, sentence_embeddings,
+def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, su_embeddings,
                               question_embedding, seed_entity_indices, seed_entity_hash_ids,
-                              seed_entity_scores, entity_to_sentence_sparse, node_name_to_vertex_idx,
+                              seed_entity_scores, entity_to_su_sparse, node_name_to_vertex_idx,
                               d_v_inv_sqrt, d_e_inv, graph_node_count, device):
     """
     Wavefront hypergraph spectral diffusion.
 
     Operator: Theta = D_v^{-1/2} H G D_e^{-1} H^T D_v^{-1/2}
     Update:   f^{t+1} = alpha * Theta @ f^{t} + (1-alpha) * f^{0}
-    Gate G:   binary mask — block sentences with query-similarity below threshold
+    Gate G:   binary mask — block semantic units with query-similarity below threshold
     Wavefront: each round keeps only top-K entities and re-normalizes,
                so the frontier advances K entities at a time.
     """
     num_entities = len(entity_hash_ids)
-    num_sentences = entity_to_sentence_sparse.shape[1]
+    num_sus = entity_to_su_sparse.shape[1]
     entity_weights = np.zeros(graph_node_count)
     top_k = config.diffusion_top_k
 
@@ -104,16 +104,16 @@ def spectral_flow_propagation(config, entity_hash_ids, entity_embeddings, senten
     if f0_norm > 0:
         f0 = f0 / f0_norm
 
-    # Phase B: Sentence gate — block sentences with low query-similarity
+    # Phase B: Semantic unit gate — block semantic units with low query-similarity
     question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
-    sentence_sims = np.dot(sentence_embeddings, question_emb).flatten()
-    w_q = torch.from_numpy(sentence_sims).float().to(device).clamp(min=0)
-    gate_mask = (w_q >= config.sentence_gate_threshold).float()
+    su_sims = np.dot(su_embeddings, question_emb).flatten()
+    w_q = torch.from_numpy(su_sims).float().to(device).clamp(min=0)
+    gate_mask = (w_q >= config.semantic_unit_gate_threshold).float()
     num_pass = int(gate_mask.sum().item())
-    logger.info(f"Sentence gate (threshold={config.sentence_gate_threshold}): "
-                f"{num_pass}/{num_sentences} pass, {num_sentences - num_pass} blocked")
+    logger.info(f"Semantic unit gate (threshold={config.semantic_unit_gate_threshold}): "
+                f"{num_pass}/{num_sus} pass, {num_sus - num_pass} blocked")
 
-    H = entity_to_sentence_sparse
+    H = entity_to_su_sparse
     H_T = H.t()
 
     # Phase C: Wavefront diffusion

@@ -10,23 +10,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build_node_edge_maps(existing_passage_hash_id_to_entities, existing_sentence_to_entities):
-    """Extract entity/sentence node sets and build bidirectional edge maps."""
+def build_node_edge_maps(existing_passage_hash_id_to_entities, existing_su_to_entities):
+    """Extract entity/semantic-unit node sets and build bidirectional edge maps."""
     entity_nodes = set()
-    sentence_nodes = set()
+    su_nodes = set()
     passage_hash_id_to_entities = defaultdict(set)
-    entity_to_sentence = defaultdict(set)
-    sentence_to_entity = defaultdict(set)
+    entity_to_su = defaultdict(set)
+    su_to_entity = defaultdict(set)
     for passage_hash_id, entities in existing_passage_hash_id_to_entities.items():
         for entity in entities:
             entity_nodes.add(entity)
             passage_hash_id_to_entities[passage_hash_id].add(entity)
-    for sentence, entities in existing_sentence_to_entities.items():
-        sentence_nodes.add(sentence)
+    for su, entities in existing_su_to_entities.items():
+        su_nodes.add(su)
         for entity in entities:
-            entity_to_sentence[entity].add(sentence)
-            sentence_to_entity[sentence].add(entity)
-    return entity_nodes, sentence_nodes, passage_hash_id_to_entities, entity_to_sentence, sentence_to_entity
+            entity_to_su[entity].add(su)
+            su_to_entity[su].add(entity)
+    return entity_nodes, su_nodes, passage_hash_id_to_entities, entity_to_su, su_to_entity
 
 
 def link_entities_to_passages(passage_hash_id_to_entities, passage_embedding_store, entity_embedding_store, node_to_node_stats):

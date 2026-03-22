@@ -24,7 +24,7 @@ def parse_arguments():
     parser.add_argument("--diffusion_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
     parser.add_argument("--diffusion_max_iter", type=int, default=10, help="Max iterations for diffusion convergence")
     parser.add_argument("--convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
-    parser.add_argument("--sentence_gate_threshold", type=float, default=0.5, help="Block sentences with query-similarity below this threshold")
+    parser.add_argument("--semantic_unit_gate_threshold", type=float, default=0.5, help="Block semantic units with query-similarity below this threshold")
     parser.add_argument("--diffusion_top_k", type=int, default=10, help="Activate top-K entities per diffusion round")
     parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B", help="Local or Hub path for the reranker model")
     parser.add_argument("--reranker_candidate_top_k", type=int, default=30, help="How many retrieval candidates to pass into the reranker")
@@ -70,7 +70,7 @@ def main():
         diffusion_alpha=args.diffusion_alpha,
         diffusion_max_iter=args.diffusion_max_iter,
         convergence_tol=args.convergence_tol,
-        sentence_gate_threshold=args.sentence_gate_threshold,
+        semantic_unit_gate_threshold=args.semantic_unit_gate_threshold,
         diffusion_top_k=args.diffusion_top_k,
         reranker_model_name=args.reranker_model,
         reranker_candidate_top_k=args.reranker_candidate_top_k,
