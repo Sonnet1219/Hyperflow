@@ -74,7 +74,9 @@ def parse_arguments():
     parser.add_argument("--reranker_batch_size", type=int, default=16)
     parser.add_argument("--reranker_max_length", type=int, default=4096)
 
-    # --- Question limit ---
+    # --- Question filter ---
+    parser.add_argument("--question_types", type=str, nargs="+", default=None,
+                        help="Only run these question types (e.g. 'Complex Reasoning')")
     parser.add_argument("--question_limit", type=int, default=None,
                         help="Limit number of questions (for testing)")
 
@@ -204,6 +206,10 @@ def main():
 
     # Load questions
     questions = load_questions(args.corpus_name)
+    if args.question_types is not None:
+        allowed = set(args.question_types)
+        questions = [q for q in questions if q.get("question_type") in allowed]
+        print(f"Filtered to question types: {args.question_types}")
     if args.question_limit is not None:
         questions = questions[:args.question_limit]
     print(f"Loaded {len(questions)} questions")

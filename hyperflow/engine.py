@@ -1,22 +1,19 @@
 """Hyperflow: Hypergraph-based retrieval-augmented generation engine."""
 
 from hyperflow.embedding_store import EmbeddingStore
-from hyperflow.utils import min_max_normalize
 from hyperflow.ner import SpacyNER, GLiNERExtractor
 from hyperflow.reranker import QwenReranker
 from hyperflow.chunker import create_semantic_units
-from hyperflow import diffusion as diff
+from hyperflow.diffusion import Hypergraph, spectral_flow_propagation
 from hyperflow import graph as gr
 
 import os
 import json
 from collections import defaultdict
 import numpy as np
-import math
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import igraph as ig
-import re
 import logging
 import torch
 
@@ -138,30 +135,15 @@ class Hyperflow:
         self.entity_embeddings = np.array(self.entity_embedding_store.embeddings)
         self.passage_hash_ids = list(self.passage_embedding_store.hash_id_to_text.keys())
         self.passage_embeddings = np.array(self.passage_embedding_store.embeddings)
-        self.su_hash_ids = list(self.su_embedding_store.hash_id_to_text.keys())
         self.su_embeddings = np.array(self.su_embedding_store.embeddings)
         self.node_name_to_vertex_idx = {v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()}
         self.vertex_idx_to_node_name = {v.index: v["name"] for v in self.graph.vs if "name" in v.attributes()}
 
-        # Build incidence matrices for spectral diffusion
-        logger.info("Building sparse incidence matrices...")
-        self.entity_to_su_sparse, self.su_to_entity_sparse = diff.build_incidence_matrix(
-            self.entity_hash_id_to_su_hash_ids, self.su_hash_id_to_entity_hash_ids,
-            self.entity_embedding_store, self.su_embedding_store, self.device
-        )
-        e2s_shape = self.entity_to_su_sparse.shape
-        s2e_shape = self.su_to_entity_sparse.shape
-        e2s_nnz = self.entity_to_su_sparse._nnz()
-        s2e_nnz = self.su_to_entity_sparse._nnz()
-        logger.info(f"Matrices built: Entity-SU {e2s_shape}, SU-Entity {s2e_shape}")
-        logger.info(f"E2S Sparsity: {(1 - e2s_nnz / (e2s_shape[0] * e2s_shape[1])) * 100:.2f}% (nnz={e2s_nnz})")
-        logger.info(f"S2E Sparsity: {(1 - s2e_nnz / (s2e_shape[0] * s2e_shape[1])) * 100:.2f}% (nnz={s2e_nnz})")
-        logger.info(f"Device: {self.device}")
-
-        # Precompute degree vectors for Laplacian normalization
-        logger.info("Computing hypergraph degree vectors...")
-        self.d_v_inv_sqrt, self.d_e_inv = diff.compute_degree_vectors(
-            self.entity_to_su_sparse, self.device
+        # Build hypergraph (incidence matrix + degree vectors, computed once)
+        logger.info("Building hypergraph...")
+        self.hypergraph = Hypergraph(
+            self.entity_hash_id_to_su_hash_ids,
+            self.entity_embedding_store, self.su_embedding_store, self.device,
         )
 
         retrieval_results = []
@@ -174,7 +156,7 @@ class Hyperflow:
             _, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores = self.extract_seed_entities(question)
             if len(seed_entities) != 0:
                 sorted_passage_hash_ids, sorted_passage_scores = self.diffuse_from_seeds(
-                    question, question_embedding, seed_entity_indices, seed_entities,
+                    question, question_embedding, seed_entity_indices,
                     seed_entity_hash_ids, seed_entity_scores
                 )
                 if use_rerank:
@@ -242,24 +224,20 @@ class Hyperflow:
         final_passages = [candidate_passages[idx] for idx in selected_indices]
         return final_passage_hash_ids, final_passage_scores, final_passages
 
-    def diffuse_from_seeds(self, question, question_embedding, seed_entity_indices, seed_entities,
+    def diffuse_from_seeds(self, question, question_embedding, seed_entity_indices,
                            seed_entity_hash_ids, seed_entity_scores):
         """Run spectral diffusion, score passages, and rank via PPR."""
-        entity_weights, actived_entities = diff.spectral_flow_propagation(
+        entity_weights, actived_entities = spectral_flow_propagation(
             config=self.config,
+            hypergraph=self.hypergraph,
             entity_hash_ids=self.entity_hash_ids,
-            entity_embeddings=self.entity_embeddings,
             su_embeddings=self.su_embeddings,
             question_embedding=question_embedding,
             seed_entity_indices=seed_entity_indices,
             seed_entity_hash_ids=seed_entity_hash_ids,
             seed_entity_scores=seed_entity_scores,
-            entity_to_su_sparse=self.entity_to_su_sparse,
             node_name_to_vertex_idx=self.node_name_to_vertex_idx,
-            d_v_inv_sqrt=self.d_v_inv_sqrt,
-            d_e_inv=self.d_e_inv,
             graph_node_count=len(self.graph.vs["name"]),
-            device=self.device,
         )
         passage_weights = gr.score_passages(
             config=self.config,
@@ -310,7 +288,6 @@ class Hyperflow:
 
     def index(self, passages):
         self.node_to_node_stats = defaultdict(dict)
-        self.entity_to_su_stats = defaultdict(dict)
         self.passage_embedding_store.insert_text(passages)
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
         existing_passage_hash_id_to_entities, existing_su_to_entities, new_passage_hash_ids = self.load_cached_ner(hash_id_to_passage.keys())
@@ -357,25 +334,18 @@ class Hyperflow:
             logger.info("All passages already have cached NER results; skipping NER recomputation.")
         self.persist_ner_data(existing_passage_hash_id_to_entities, existing_su_to_entities)
 
-        entity_nodes, su_nodes, passage_hash_id_to_entities, self.entity_to_su, self.su_to_entity = \
+        entity_nodes, su_nodes, passage_hash_id_to_entities, entity_to_su, _ = \
             gr.build_node_edge_maps(existing_passage_hash_id_to_entities, existing_su_to_entities)
 
         self.su_embedding_store.insert_text(list(su_nodes))
         self.entity_embedding_store.insert_text(list(entity_nodes))
 
         self.entity_hash_id_to_su_hash_ids = {}
-        for entity, sus in self.entity_to_su.items():
+        for entity, sus in entity_to_su.items():
             entity_hash_id = self.entity_embedding_store.text_to_hash_id[entity]
             self.entity_hash_id_to_su_hash_ids[entity_hash_id] = [
                 self.su_embedding_store.text_to_hash_id[s] for s in sus
             ]
-        self.su_hash_id_to_entity_hash_ids = {}
-        for su, entities in self.su_to_entity.items():
-            su_hash_id = self.su_embedding_store.text_to_hash_id[su]
-            self.su_hash_id_to_entity_hash_ids[su_hash_id] = [
-                self.entity_embedding_store.text_to_hash_id[e] for e in entities
-            ]
-
         gr.link_entities_to_passages(passage_hash_id_to_entities, self.passage_embedding_store,
                                      self.entity_embedding_store, self.node_to_node_stats)
         gr.link_adjacent_passages(self.passage_embedding_store, self.node_to_node_stats)

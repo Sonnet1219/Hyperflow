@@ -58,8 +58,12 @@ class HyperflowConfig:
     diffusion_alpha: float = 0.85       # diffusion weight (higher = more exploration, less teleport)
     diffusion_max_iter: int = 10        # convergence iteration limit
     convergence_tol: float = 1e-4       # L2 norm convergence threshold
-    semantic_unit_gate_threshold: float = 0.5  # block semantic units with query-similarity below this
+    semantic_unit_gate_threshold: float = 0.5  # (legacy) binary gate threshold; unused by anisotropic diffusion
     diffusion_top_k: int = 10           # activate top-K entities per diffusion round
+    # Anisotropic conductance parameters
+    conductance_floor: float = 0.3           # query-SU sim below this → zero conductance
+    conductance_gamma: float = 0.5           # power exponent for conductance curve (< 1 broadens mid-range)
+    conductance_diversity_beta: float = 0.3  # diversity penalty strength (0 = disabled)
     # Semantic unit chunking
     semantic_unit_percentile: int = 80  # Kamradt percentile for semantic unit boundary detection
     # Attribute fallback
