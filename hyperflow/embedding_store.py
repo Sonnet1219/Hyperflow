@@ -78,3 +78,4 @@ class EmbeddingStore:
         indices = np.array([self.hash_id_to_idx[h] for h in hash_ids], dtype=np.intp)
         embeddings = np.array(self.embeddings)[indices]
         return embeddings
+

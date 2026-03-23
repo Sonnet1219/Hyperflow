@@ -4,14 +4,18 @@ from collections import defaultdict
 
 import spacy
 
+from hyperflow.entity_normalization import EntityNormalizer, normalize_entity_list
+
 
 logger = logging.getLogger(__name__)
 
 
 class SpacyNER:
     def __init__(self, spacy_model):
+        spacy.require_gpu()
         self.spacy_model = spacy.load(spacy_model)
-        logger.info("spaCy NER loaded with model: %s", spacy_model)
+        self.normalizer = EntityNormalizer(self.spacy_model)
+        logger.info("spaCy NER loaded with model: %s (GPU enabled)", spacy_model)
 
     def batch_ner(self, hash_id_to_passage, max_workers):
         passage_list = list(hash_id_to_passage.values())
@@ -43,7 +47,7 @@ class SpacyNER:
             if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
                 continue
             sent_text = ent.sent.text
-            ent_text = ent.text.lower()
+            ent_text = self.normalizer.canonicalize(ent.text.lower())
             if ent_text not in su_to_entities[sent_text]:
                 su_to_entities[sent_text].append(ent_text)
             unique_entities.add(ent_text)
@@ -53,12 +57,12 @@ class SpacyNER:
     def extract_entities_from_text(self, text):
         """Extract entities from a single text string (semantic unit)."""
         doc = self.spacy_model(text)
-        entities = []
+        entities = set()
         for ent in doc.ents:
             if ent.label_ in ("ORDINAL", "CARDINAL"):
                 continue
-            entities.append(ent.text.lower())
-        return list(set(entities))
+            entities.add(self.normalizer.canonicalize(ent.text.lower()))
+        return list(entities)
 
     def question_ner(self, question: str):
         doc = self.spacy_model(question)
@@ -66,7 +70,7 @@ class SpacyNER:
         for ent in doc.ents:
             if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
                 continue
-            question_entities.add(ent.text.lower())
+            question_entities.add(self.normalizer.canonicalize(ent.text.lower()))
         return question_entities
 
 
@@ -75,19 +79,24 @@ class GLiNERExtractor:
 
     def __init__(self, model_name="knowledgator/gliner-bi-large-v2.0",
                  labels=None, threshold=0.3, min_entity_length=3,
-                 enable_long_text_windowing=True, window_overlap_sentences=1):
+                 enable_long_text_windowing=True, window_overlap_sentences=1,
+                 normalizer=None, device=None):
+        import torch
         from gliner import GLiNER
-        self.model = GLiNER.from_pretrained(model_name)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = GLiNER.from_pretrained(model_name).to(self.device)
         self.labels = labels or []
         self.threshold = threshold
         self.min_length = min_entity_length
+        self.normalizer = normalizer
         self.enable_long_text_windowing = enable_long_text_windowing
         self.window_overlap_sentences = max(0, window_overlap_sentences)
         self.max_length = getattr(self.model.config, "max_len", None)
         self.sentencizer = self._build_sentencizer()
         logger.info(
-            "GLiNER loaded: model=%s, labels=%s, threshold=%s, max_len=%s, long_text_windowing=%s, overlap_sentences=%s",
+            "GLiNER loaded: model=%s, device=%s, labels=%s, threshold=%s, max_len=%s, long_text_windowing=%s, overlap_sentences=%s",
             model_name,
+            self.device,
             self.labels,
             self.threshold,
             self.max_length,
@@ -109,6 +118,8 @@ class GLiNERExtractor:
         return self.model.predict_entities(text, self.labels, threshold=self.threshold)
 
     def _normalize_entity_texts(self, entities):
+        if self.normalizer is not None:
+            return normalize_entity_list(self.normalizer, entities, self.min_length)
         normalized_entities = []
         seen = set()
         for entity in entities:

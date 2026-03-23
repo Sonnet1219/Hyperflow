@@ -1,4 +1,4 @@
-"""Entry point for GraphRAG-Bench benchmark evaluation.
+"""Run Hyperflow on GraphRAG-Bench benchmark.
 
 Pipeline:
   1. Load corpus & questions from local HuggingFace cache
@@ -16,15 +16,19 @@ import sys
 import warnings
 from datetime import datetime
 
-from sentence_transformers import SentenceTransformer
-from hyperflow.config import HyperflowConfig, get_gliner_labels_for_corpus
+# Ensure project root is on sys.path so `hyperflow` is importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from hyperflow.config import get_gliner_labels_for_corpus
 from hyperflow.engine import Hyperflow
-from hyperflow.bench import load_corpus, load_questions, format_results
 from hyperflow.chunker import chunk_corpus_by_tokens
-from hyperflow.utils import LLM_Model, setup_logging
+from hyperflow.utils import setup_logging
+from bench import load_corpus, load_questions, format_results
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 warnings.filterwarnings("ignore")
+
+PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 
 # Path to the cloned official GraphRAG-Benchmark repo
 EVAL_REPO_DIR = os.path.expanduser("~/GraphRAG-Benchmark")
@@ -63,7 +67,6 @@ def parse_arguments():
     parser.add_argument("--diffusion_alpha", type=float, default=0.85)
     parser.add_argument("--diffusion_max_iter", type=int, default=10)
     parser.add_argument("--convergence_tol", type=float, default=1e-4)
-    parser.add_argument("--semantic_unit_gate_threshold", type=float, default=0.5)
     parser.add_argument("--diffusion_top_k", type=int, default=10)
 
     # --- Reranker ---
@@ -190,12 +193,9 @@ def run_official_eval(predictions_path: str, output_dir: str, args):
 def main():
     time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     args = parse_arguments()
-    output_dir = f"results/graphrag-bench/{args.corpus_name}/{time_str}"
+    output_dir = os.path.join(PROJECT_ROOT, f"results/graphrag-bench/{args.corpus_name}/{time_str}")
     os.makedirs(output_dir, exist_ok=True)
     setup_logging(f"{output_dir}/log.txt")
-
-    # Load embedding model
-    embedding_model = SentenceTransformer(args.embedding_model, device="cuda")
 
     # Load corpus and chunk it
     corpus_text = load_corpus(args.corpus_name)
@@ -217,21 +217,19 @@ def main():
     # Set up GLiNER labels based on corpus
     gliner_labels = get_gliner_labels_for_corpus(args.corpus_name)
 
-    # Create config
-    llm_model = LLM_Model(args.llm_model)
-    config = HyperflowConfig(
-        dataset_name=f"graphrag-bench-{args.corpus_name}",
-        embedding_model=embedding_model,
+    # Create Hyperflow instance
+    model = Hyperflow(
+        save_dir=os.path.join(PROJECT_ROOT, f"index_store/graphrag-bench-{args.corpus_name}"),
+        llm_model_name=args.llm_model,
+        embedding_model_name=args.embedding_model,
         spacy_model=args.spacy_model,
         max_workers=args.max_workers,
-        llm_model=llm_model,
         chunk_token_size=args.chunk_size,
         chunk_overlap_token_size=args.chunk_overlap,
         passage_ratio=args.passage_ratio,
         diffusion_alpha=args.diffusion_alpha,
         diffusion_max_iter=args.diffusion_max_iter,
         convergence_tol=args.convergence_tol,
-        semantic_unit_gate_threshold=args.semantic_unit_gate_threshold,
         semantic_unit_percentile=args.semantic_unit_percentile,
         diffusion_top_k=args.diffusion_top_k,
         use_reranker=not args.no_rerank,
@@ -246,7 +244,6 @@ def main():
     )
 
     # Index
-    model = Hyperflow(global_config=config)
     model.index(passages)
     print("Indexing complete.")
 
@@ -255,10 +252,20 @@ def main():
         return
 
     # QA
-    results = model.qa(questions)
+    queries = [q["question"] for q in questions]
+    results = model.rag_qa(queries)
 
     # Format and save in official GraphRAG-Bench unified format
-    formatted = format_results(results, questions)
+    # Convert to the format expected by format_results
+    legacy_results = []
+    for result, q in zip(results, questions):
+        legacy_results.append({
+            "question": result["query"],
+            "sorted_passage": result["passages"],
+            "pred_answer": result["answer"],
+            "gold_answer": q["answer"],
+        })
+    formatted = format_results(legacy_results, questions)
     predictions_path = os.path.join(output_dir, "predictions.json")
     with open(predictions_path, "w", encoding="utf-8") as f:
         json.dump(formatted, f, ensure_ascii=False, indent=2)

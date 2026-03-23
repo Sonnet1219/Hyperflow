@@ -1,7 +1,12 @@
-"""Hypergraph spectral diffusion for entity score propagation.
+"""Hop-wise frontier expansion on a hypergraph for multi-hop entity discovery.
 
 Vertices  = entities
 Hyperedges = semantic units (each hyperedge connects all entities that co-occur in one SU)
+
+Algorithm: instead of spectral diffusion (which converges to a fixed point and
+freezes), we do explicit BFS-like hop-by-hop exploration.  Each hop discovers
+NEW entities through query-relevant SUs, then those new entities become the
+frontier for the next hop.
 """
 
 import numpy as np
@@ -15,9 +20,6 @@ class Hypergraph:
     """Sparse hypergraph backed by an incidence matrix H.
 
     H[v, e] = 1  iff vertex v belongs to hyperedge e.
-
-    Precomputes degree-normalisation vectors so that repeated propagation
-    calls (one per query) only pay the construction cost once.
     """
 
     def __init__(self, entity_hash_id_to_su_hash_ids,
@@ -48,16 +50,12 @@ class Hypergraph:
                 (self.num_vertices, self.num_hyperedges), device=device,
             )
 
-        # Degree vectors
-        ones_e = torch.ones(self.num_hyperedges, 1, device=device)
-        d_v = torch.sparse.mm(self.H, ones_e).squeeze()           # vertex degree
-        ones_v = torch.ones(self.num_vertices, 1, device=device)
-        d_e = torch.sparse.mm(self.H.t(), ones_v).squeeze()       # hyperedge degree
-
-        self._d_v_inv_sqrt = torch.where(d_v > 0, d_v.pow(-0.5), torch.zeros_like(d_v))
-        self._d_e_inv = torch.where(d_e > 0, d_e.pow(-1.0), torch.zeros_like(d_e))
-
         nnz = self.H._nnz()
+        ones_e = torch.ones(self.num_hyperedges, 1, device=device)
+        d_v = torch.sparse.mm(self.H, ones_e).squeeze()
+        ones_v = torch.ones(self.num_vertices, 1, device=device)
+        d_e = torch.sparse.mm(self.H.t(), ones_v).squeeze()
+
         logger.info(
             "Hypergraph built: %d vertices, %d hyperedges, nnz=%d, "
             "sparsity=%.2f%%, D_v range [%.0f, %.0f], D_e range [%.0f, %.0f]",
@@ -66,159 +64,147 @@ class Hypergraph:
             d_v.min(), d_v.max(), d_e.min(), d_e.max(),
         )
 
-    def propagate(self, f, hyperedge_weights=None):
-        """One-step spectral propagation on the hypergraph.
 
-        Operator:  Θ_W f = D_v^{-1/2}  H  W  D_e^{-1}  H^T  D_v^{-1/2}  f
+def frontier_expansion(config, hypergraph, entity_hash_ids,
+                       su_embeddings, question_embedding,
+                       seed_entity_indices, seed_entity_hash_ids,
+                       seed_entity_scores, node_name_to_vertex_idx,
+                       graph_node_count):
+    """Hop-wise frontier expansion on a hypergraph.
 
-        Args:
-            f: vertex signal vector  (num_vertices,)
-            hyperedge_weights: optional per-hyperedge weight/gate vector (num_hyperedges,).
-                               If None, all weights are 1 (standard Laplacian).
+    Each hop:
+      1. Find SUs reachable from the current frontier, gated by query relevance.
+      2. Through those SUs, discover new (not yet activated) entities.
+      3. Score each candidate via max-aggregation:
+            score(v) = max over reachable SUs e containing v:
+                       w[e] × max(frontier_score of frontier entities in e)
+      4. Keep top-K new entities; they become the next frontier.
 
-        Returns:
-            Propagated vertex signal  (num_vertices,)
-        """
-        x = self._d_v_inv_sqrt * f                                         # D_v^{-1/2} f
-        x = torch.sparse.mm(self.H.t(), x.unsqueeze(1)).squeeze(1)        # H^T x  → hyperedge signals
-        x = self._d_e_inv * x                                              # D_e^{-1}
-        if hyperedge_weights is not None:
-            x = hyperedge_weights * x                                       # W (gate)
-        x = torch.sparse.mm(self.H, x.unsqueeze(1)).squeeze(1)            # H x    → back to vertices
-        x = self._d_v_inv_sqrt * x                                         # D_v^{-1/2}
-        return x
-
-
-def spectral_flow_propagation(config, hypergraph, entity_hash_ids,
-                              su_embeddings, question_embedding,
-                              seed_entity_indices, seed_entity_hash_ids,
-                              seed_entity_scores, node_name_to_vertex_idx,
-                              graph_node_count):
-    """Anisotropic hypergraph spectral diffusion with novelty-seeking conductance.
-
-    Operator:  Θ_{W(t)} = D_v^{-1/2}  H  W(t)  D_e^{-1}  H^T  D_v^{-1/2}
-    Update:    f^{t+1} = α · Θ_{W(t)} f^t  +  (1-α) · f^0
-
-    Conductance W(t) is query-conditioned and diversity-aware:
-
-        w_e^(t) = [ (sim(e, q) - τ)_+ / (1 - τ) ]^γ          (base relevance)
-                  × (1 - β · max_{e' ∈ covered} sim(e, e'))    (novelty factor)
-
-    The base conductance is a continuous soft gate: hyperedges with query
-    similarity below τ receive zero conductance; above τ the weight is
-    power-compressed (γ < 1 broadens mid-range contributions).
-    The novelty factor penalises hyperedges similar to those already
-    explored, encouraging the diffusion frontier to spread into novel
-    regions of the hypergraph — analogous to anisotropic diffusion
-    where the medium's conductivity adapts to the diffusing signal.
-
-    Wavefront: each round keeps only top-K vertices and re-normalises,
-    so the frontier advances K vertices at a time.
+    No degree normalisation (D_v, D_e) is applied — signal flows through
+    SU conductance only, so hub entities are not penalised.
     """
     device = hypergraph.device
     num_vertices = hypergraph.num_vertices
     num_hyperedges = hypergraph.num_hyperedges
     entity_weights = np.zeros(graph_node_count)
     top_k = config.diffusion_top_k
+    max_hops = config.diffusion_max_hops
+    hop_decay = config.hop_decay
 
-    # Phase A: Initialise f^(0) from seed entities
-    f0 = torch.zeros(num_vertices, device=device)
-    for idx, score in zip(seed_entity_indices, seed_entity_scores):
-        f0[idx] = float(score)
-    f0_norm = f0.norm()
-    if f0_norm > 0:
-        f0 = f0 / f0_norm
+    H = hypergraph.H            # (|V|, |E|) sparse
+    H_t = H.t()                 # (|E|, |V|) sparse
 
-    # Phase B: Query-conditioned base conductance (continuous soft gate)
-    question_emb = question_embedding.reshape(-1, 1) if len(question_embedding.shape) == 1 else question_embedding
+    # ── Phase A: Query-conditioned SU conductance ──
+    question_emb = (question_embedding.reshape(-1, 1)
+                    if len(question_embedding.shape) == 1
+                    else question_embedding)
     su_sims = np.dot(su_embeddings, question_emb).flatten()
     w_q = torch.from_numpy(su_sims).float().to(device).clamp(min=0)
 
     floor = config.conductance_floor
     gamma = config.conductance_gamma
     w_base = torch.clamp(w_q - floor, min=0) / max(1.0 - floor, 1e-8)
-    w_conductance = w_base.pow(gamma)
+    w_conductance = w_base.pow(gamma)                       # (|E|,)
 
     num_active = int((w_conductance > 0).sum().item())
     logger.info(
-        "Anisotropic conductance (floor=%.2f, gamma=%.2f): "
-        "%d/%d active hyperedges, %d suppressed",
+        "Conductance (floor=%.2f, gamma=%.2f): %d/%d active SUs, %d suppressed",
         floor, gamma, num_active, num_hyperedges, num_hyperedges - num_active,
     )
 
-    # Phase C: Anisotropic diffusion with diversity-aware conductance
-    alpha = config.diffusion_alpha
-    beta = config.conductance_diversity_beta
-    f = f0.clone()
-    activated_indices = set()
+    # ── Phase B: Initialise seeds ──
+    # activated: entity_idx → score
+    activated = {}
+    for idx, score in zip(seed_entity_indices, seed_entity_scores):
+        activated[idx] = float(score)
 
-    # Precompute SU embedding tensor for diversity computation
-    su_emb_tensor = torch.from_numpy(su_embeddings).float().to(device) if beta > 0 else None
-    H_t = hypergraph.H.t()  # (|E|, |V|) sparse — maps vertices to hyperedges
-    covered_su_indices = set()
+    frontier = set(activated.keys())
 
-    for t in range(config.diffusion_max_iter):
-        # Compute per-round conductance: base relevance × novelty
-        if beta > 0 and len(covered_su_indices) > 0:
-            covered_list = sorted(covered_su_indices)
-            covered_embs = su_emb_tensor[covered_list]               # (|covered|, dim)
-            sim_matrix = torch.mm(su_emb_tensor, covered_embs.t())   # (|E|, |covered|)
-            max_sim = sim_matrix.max(dim=1).values.clamp(min=0)      # (|E|,)
-            novelty = (1.0 - beta * max_sim).clamp(min=0)
-            w_t = w_conductance * novelty
-        else:
-            w_t = w_conductance
+    # Precompute COO structure once
+    H_coo = H.coalesce()
+    h_indices = H_coo.indices()   # (2, nnz)
+    h_v_idx = h_indices[0]        # vertex indices for each edge
+    h_e_idx = h_indices[1]        # hyperedge indices for each edge
 
-        theta_f = hypergraph.propagate(f, hyperedge_weights=w_t)
-        f_new = alpha * theta_f + (1 - alpha) * f0
-        delta = (f_new - f).norm().item()
-
-        # Wavefront: keep top-K, zero rest, re-normalise
-        top_indices = torch.topk(f_new, min(top_k, num_vertices)).indices
-        activated_indices.update(top_indices.cpu().tolist())
-
-        # Update covered hyperedges: find SUs containing any top-K vertex
-        if beta > 0:
-            indicator = torch.zeros(num_vertices, 1, device=device)
-            indicator[top_indices] = 1.0
-            su_activation = torch.sparse.mm(H_t, indicator).squeeze(1)  # (|E|,)
-            newly_covered = (su_activation > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-            covered_su_indices.update(newly_covered)
-
-        mask = torch.zeros(num_vertices, device=device)
-        mask[top_indices] = 1.0
-        f = f_new * mask
-        f_norm = f.norm()
-        if f_norm > 0:
-            f = f / f_norm
-
-        if delta < config.convergence_tol:
-            logger.debug("Anisotropic diffusion converged at iteration %d (delta=%.6f)", t + 1, delta)
+    # ── Phase C: Hop-by-hop frontier expansion ──
+    for hop in range(1, max_hops + 1):
+        if not frontier:
             break
 
-    if beta > 0:
-        logger.info("Diffusion finished: %d rounds, %d covered hyperedges, %d activated vertices",
-                     t + 1, len(covered_su_indices), len(activated_indices))
+        # 1) Build frontier score vector
+        frontier_scores = torch.zeros(num_vertices, device=device)
+        for idx in frontier:
+            frontier_scores[idx] = activated[idx]
 
-    # Phase D: Collect activated entities (seeds + all wavefront discoveries)
-    actived_entities = {}
+        # 2) For each COO entry (v, e), if v is in frontier, record score into SU e
+        #    Then take max per SU → max frontier score per SU
+        is_frontier = frontier_scores[h_v_idx] > 0                   # (nnz,) bool
+        frontier_signal = torch.where(is_frontier, frontier_scores[h_v_idx], torch.tensor(0.0, device=device))
+
+        # Scatter max: for each hyperedge, find the max frontier score
+        max_frontier_per_su = torch.zeros(num_hyperedges, device=device)
+        max_frontier_per_su.scatter_reduce_(0, h_e_idx, frontier_signal, reduce="amax")
+
+        # 3) Bridge score = conductance × max frontier score (only for active SUs)
+        bridge_scores = w_conductance * max_frontier_per_su                  # (|E|,)
+
+        # 4) For each COO entry (v, e), propagate bridge_scores[e] to vertex v
+        #    Then scatter max to get candidate score per vertex
+        candidate_scores = torch.full((num_vertices,), -1.0, device=device)
+        edge_bridge = bridge_scores[h_e_idx]                                 # (nnz,)
+        candidate_scores.scatter_reduce_(0, h_v_idx, edge_bridge, reduce="amax")
+
+        # Zero out already-activated entities
+        activated_tensor = torch.zeros(num_vertices, dtype=torch.bool, device=device)
+        for idx in activated:
+            activated_tensor[idx] = True
+        candidate_scores[activated_tensor] = -1.0
+
+        # 5) Select top-K new entities with positive scores
+        num_positive = int((candidate_scores > 0).sum().item())
+        if num_positive == 0:
+            logger.debug("Hop %d: no new candidates found, stopping.", hop)
+            break
+
+        k = min(top_k, num_positive)
+        top_vals, top_idx = torch.topk(candidate_scores, k)
+
+        decay = hop_decay ** hop
+        new_frontier = set()
+        for idx, score in zip(top_idx.cpu().tolist(), top_vals.cpu().tolist()):
+            if score <= 0:
+                break
+            activated[idx] = score * decay
+            new_frontier.add(idx)
+
+        logger.debug(
+            "Hop %d: %d new entities (top score=%.4f, decay=%.3f), "
+            "%d total activated",
+            hop, len(new_frontier),
+            top_vals[0].item() if len(top_vals) > 0 else 0, decay,
+            len(activated),
+        )
+
+        frontier = new_frontier
+
+    logger.info(
+        "Frontier expansion finished: %d hops, %d activated entities",
+        min(hop, max_hops) if frontier else hop - 1, len(activated),
+    )
+
+    # ── Phase D: Collect results ──
+    activated_entities = {}
     for idx, hash_id, score in zip(seed_entity_indices, seed_entity_hash_ids, seed_entity_scores):
-        actived_entities[hash_id] = (idx, score, 1)
+        activated_entities[hash_id] = (idx, score, 1)
         if hash_id in node_name_to_vertex_idx:
             entity_weights[node_name_to_vertex_idx[hash_id]] = score
 
-    if f0_norm > 0:
-        final_scores = (f * f0_norm).cpu().numpy()
-    else:
-        final_scores = f.cpu().numpy()
-
-    for entity_idx in activated_indices:
+    for entity_idx, score in activated.items():
         hash_id = entity_hash_ids[entity_idx]
-        if hash_id not in actived_entities:
-            score = max(float(final_scores[entity_idx]), 0.01)
-            actived_entities[hash_id] = (entity_idx, score, 1)
+        if hash_id not in activated_entities:
+            activated_entities[hash_id] = (entity_idx, score, 1)
         if hash_id in node_name_to_vertex_idx:
             node_idx = node_name_to_vertex_idx[hash_id]
-            entity_weights[node_idx] = max(entity_weights[node_idx], float(final_scores[entity_idx]))
+            entity_weights[node_idx] = max(entity_weights[node_idx], score)
 
-    return entity_weights, actived_entities
+    return entity_weights, activated_entities

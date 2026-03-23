@@ -18,3 +18,5 @@ venv
 results/
 tmp*
 exp*
+exp_*
+index_store
