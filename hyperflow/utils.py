@@ -1,18 +1,15 @@
 from hashlib import md5
-from dataclasses import dataclass, field
-from typing import List, Dict
 import httpx
 from openai import OpenAI
-from collections import defaultdict
-import multiprocessing as mp
 import re
 import string
 import logging
-import numpy as np
 import os
+
 
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + md5(content.encode()).hexdigest()
+
 
 class LLM_Model:
     def __init__(self, llm_model):
@@ -27,14 +24,14 @@ class LLM_Model:
             "max_tokens": 2000,
             "temperature": 0,
         }
+
     def infer(self, messages):
         try:
-            response = self.openai_client.chat.completions.create(**self.llm_config,messages=messages)
+            response = self.openai_client.chat.completions.create(**self.llm_config, messages=messages)
             return response.choices[0].message.content
         except Exception as e:
             logging.getLogger(__name__).warning("LLM infer failed: %s", e)
             return ""
-
 
 
 def normalize_answer(s):
@@ -53,6 +50,7 @@ def normalize_answer(s):
         return text.lower()
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
+
 def setup_logging(log_file):
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     handlers = [logging.StreamHandler()]
@@ -67,13 +65,3 @@ def setup_logging(log_file):
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
-
-def min_max_normalize(x):
-    min_val = np.min(x)
-    max_val = np.max(x)
-    range_val = max_val - min_val
-
-    if range_val == 0:
-        return np.ones_like(x)
-
-    return (x - min_val) / range_val

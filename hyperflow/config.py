@@ -48,21 +48,17 @@ class HyperflowConfig:
     batch_size: int = 128
     max_workers: int = 16
     retrieval_top_k: int = 5
-    passage_ratio: float = 1.5
-    passage_node_weight: float = 0.05
-    damping: float = 0.5
+    # Dual-channel passage scoring
+    scoring_lambda: float = 0.5             # fusion weight (1.0 = pure dense, 0.0 = pure entity coverage)
     # Frontier expansion parameters
-    diffusion_max_hops: int = 3         # max BFS hops from seed entities
-    diffusion_top_k: int = 15           # new entities discovered per hop
-    hop_decay: float = 0.7              # score decay per hop (score × decay^hop)
+    expansion_max_hops: int = 3             # max BFS hops from seed entities
+    expansion_top_k: int = 15              # new entities discovered per hop
+    hop_decay: float = 0.5                  # score decay per hop (score × decay^hop)
     # SU conductance gating
-    conductance_floor: float = 0.3           # query-SU sim below this -> zero conductance
-    conductance_gamma: float = 0.5           # power exponent for conductance curve (< 1 broadens mid-range)
+    conductance_floor: float = 0.5          # query-SU sim below this -> zero conductance
+    conductance_gamma: float = 1.0          # power exponent (1.0 = linear, < 1 broadens, > 1 sharpens)
     # Semantic unit chunking
-    semantic_unit_percentile: int = 80  # Kamradt percentile for semantic unit boundary detection
-    # Attribute fallback
-    enable_hybrid_attribute_fallback: bool = False
-    attribute_keyword_boost: float = 0.25
+    semantic_unit_percentile: int = 80      # Kamradt percentile for SU boundary detection
     # Reranker
     use_reranker: bool = True
     reranker_model_name: str = "Qwen/Qwen3-Reranker-4B"
@@ -73,12 +69,8 @@ class HyperflowConfig:
         "Given a multi-hop question, judge whether the document contains evidence "
         "that helps answer the question, either directly or as an intermediate bridge."
     )
-    attribute_query_keywords: list[str] = field(default_factory=lambda: [
-        "born", "birth", "where", "when", "located", "location", "founded", "founder",
-        "died", "death", "nationality", "capital", "date", "year"
-    ])
     # NER backend
-    ner_backend: str = "gliner"  # "gliner" or "spacy"
+    ner_backend: str = "gliner"             # "gliner" or "spacy"
     gliner_model: str = "urchade/gliner_large-v2.1"
     gliner_threshold: float = 0.3
     gliner_labels: list[str] = field(default_factory=lambda: list(MEDICAL_GLINER_LABELS))

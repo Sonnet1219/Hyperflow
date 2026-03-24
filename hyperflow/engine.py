@@ -6,8 +6,8 @@ from hyperflow.entity_normalization import merge_similar_entities
 from hyperflow.ner import SpacyNER, GLiNERExtractor
 from hyperflow.reranker import QwenReranker
 from hyperflow.chunker import create_semantic_units
-from hyperflow.diffusion import frontier_expansion
-from hyperflow.graph import KnowledgeGraph, dense_retrieval
+from hyperflow.frontier import frontier_expansion
+from hyperflow.knowledge_graph import KnowledgeGraph, dense_retrieval
 from hyperflow.utils import LLM_Model
 
 import os
@@ -32,7 +32,7 @@ class Hyperflow:
             **kwargs,
         )
         logger.info("Initializing Hyperflow with config: %s", self.config)
-        logger.info("Retrieval method: Hypergraph Spectral Diffusion")
+        logger.info("Retrieval method: Frontier Expansion")
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info("Using device: %s", self.device)
@@ -178,10 +178,6 @@ class Hyperflow:
             passage_to_entities, self.passage_embedding_store, self.entity_embedding_store
         )
         self.knowledge_graph.link_adjacent_passages(self.passage_embedding_store)
-        self.knowledge_graph.finalize(self.entity_embedding_store, self.passage_embedding_store)
-
-        graphml_path = os.path.join(self.config.save_dir, "Hyperflow.graphml")
-        self.knowledge_graph.save(graphml_path)
 
     def _load_cached_ner(self, passage_hash_ids):
         self._ner_cache_path = os.path.join(self.config.save_dir, "ner_results.json")
@@ -223,7 +219,7 @@ class Hyperflow:
             logger.info("Reranking enabled: top %s candidates -> top %s final passages",
                         self.config.reranker_candidate_top_k, top_k)
         else:
-            logger.info("Reranking disabled. Using diffusion/PPR scores directly (top %s).", top_k)
+            logger.info("Reranking disabled. Using dual-channel scoring (top %s).", top_k)
 
         self._prepare_retrieval_cache()
 
@@ -289,11 +285,23 @@ class Hyperflow:
         self._passage_embeddings = np.array(self.passage_embedding_store.embeddings)
         self._su_embeddings = np.array(self.su_embedding_store.embeddings)
 
-        # Build hypergraph for spectral diffusion
+        # Build hypergraph
         logger.info("Building hypergraph...")
         self.knowledge_graph.build_hypergraph(
-            self.entity_embedding_store, self.su_embedding_store, self.device
+            self.entity_embedding_store, self.su_embedding_store, self.device,
         )
+
+        # Precompute entity IDF for dual-channel scoring
+        kg = self.knowledge_graph
+        num_passages = len(self._passage_hash_ids)
+        self._entity_idf = {}
+        for p_hid, entity_weights in kg.edge_weights.items():
+            for e_hid in entity_weights:
+                if e_hid not in self._entity_idf:
+                    self._entity_idf[e_hid] = 0
+                self._entity_idf[e_hid] += 1
+        for e_hid in self._entity_idf:
+            self._entity_idf[e_hid] = np.log(num_passages / max(self._entity_idf[e_hid], 1))
 
     def extract_seed_entities(self, query):
         """Extract named entities from query and find closest indexed entities."""
@@ -324,11 +332,16 @@ class Hyperflow:
 
     def _diffuse_from_seeds(self, query, query_embedding, seed_indices,
                             seed_hash_ids, seed_scores):
-        """Run spectral diffusion, score passages, and rank via PPR."""
-        kg = self.knowledge_graph
-        graph_node_count = len(kg.graph.vs)
+        """Run frontier expansion + dual-channel evidence fusion.
 
-        entity_weights, activated_entities = frontier_expansion(
+        Channel 1 (semantic): cosine(passage_embedding, query_embedding)
+        Channel 2 (coverage): activation-weighted entity coverage with IDF
+
+        final_score(p) = λ · semantic(p) + (1-λ) · coverage(p)
+        """
+        kg = self.knowledge_graph
+
+        activated_entities = frontier_expansion(
             config=self.config,
             hypergraph=kg._hypergraph,
             entity_hash_ids=self._entity_hash_ids,
@@ -337,23 +350,39 @@ class Hyperflow:
             seed_entity_indices=seed_indices,
             seed_entity_hash_ids=seed_hash_ids,
             seed_entity_scores=seed_scores,
-            node_name_to_vertex_idx=kg.node_name_to_vertex_idx,
-            graph_node_count=graph_node_count,
         )
-        passage_weights = kg.score_passages(
-            config=self.config,
-            query=query,
-            query_embedding=query_embedding,
-            activated_entities=activated_entities,
-            passage_embeddings=self._passage_embeddings,
-            passage_store=self.passage_embedding_store,
-            entity_store=self.entity_embedding_store,
-        )
-        node_weights = entity_weights + passage_weights
-        sorted_hash_ids, sorted_scores = kg.personalized_pagerank(
-            node_weights=node_weights,
-            damping=self.config.damping,
-        )
+
+        # Channel 1: Dense semantic similarity
+        dense_sims = np.dot(self._passage_embeddings, query_embedding)
+
+        # Channel 2: Activation-weighted entity coverage with IDF
+        coverage_scores = np.zeros(len(self._passage_hash_ids))
+        total_activation = sum(v[1] for v in activated_entities.values())
+        if total_activation > 0:
+            for p_idx, p_hid in enumerate(self._passage_hash_ids):
+                if p_hid in kg.edge_weights:
+                    cov = 0.0
+                    for e_hid in kg.edge_weights[p_hid]:
+                        if e_hid in activated_entities:
+                            act_score = activated_entities[e_hid][1]
+                            idf = self._entity_idf.get(e_hid, 1.0)
+                            cov += act_score * idf
+                    coverage_scores[p_idx] = cov / total_activation
+
+        # Normalize both to [0, 1]
+        d_max = dense_sims.max()
+        dense_norm = dense_sims / d_max if d_max > 0 else dense_sims
+        c_max = coverage_scores.max()
+        coverage_norm = coverage_scores / c_max if c_max > 0 else coverage_scores
+
+        # Fuse
+        lam = self.config.scoring_lambda
+        final_scores = lam * dense_norm + (1 - lam) * coverage_norm
+
+        # Sort and return
+        sorted_indices = np.argsort(final_scores)[::-1]
+        sorted_hash_ids = [self._passage_hash_ids[i] for i in sorted_indices]
+        sorted_scores = final_scores[sorted_indices].tolist()
         return sorted_hash_ids, sorted_scores
 
     def _lazy_load_reranker(self):

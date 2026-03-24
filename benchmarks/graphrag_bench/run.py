@@ -63,15 +63,16 @@ def parse_arguments():
 
     # --- Retrieval ---
     parser.add_argument("--max_workers", type=int, default=16)
-    parser.add_argument("--passage_ratio", type=float, default=2)
-    parser.add_argument("--diffusion_alpha", type=float, default=0.85)
-    parser.add_argument("--diffusion_max_iter", type=int, default=10)
-    parser.add_argument("--convergence_tol", type=float, default=1e-4)
-    parser.add_argument("--diffusion_top_k", type=int, default=10)
+    parser.add_argument("--expansion_max_hops", type=int, default=3, help="Max BFS hops from seed entities")
+    parser.add_argument("--expansion_top_k", type=int, default=15, help="New entities discovered per hop")
+    parser.add_argument("--hop_decay", type=float, default=0.5, help="Score decay per hop")
+    parser.add_argument("--conductance_floor", type=float, default=0.3, help="SU conductance floor")
+    parser.add_argument("--conductance_gamma", type=float, default=1.0, help="SU conductance power exponent")
+    parser.add_argument("--scoring_lambda", type=float, default=0.7, help="Dual-channel fusion weight (1.0=dense, 0.0=entity)")
 
     # --- Reranker ---
     parser.add_argument("--no_rerank", action="store_true",
-                        help="Disable reranking (use diffusion/PPR scores directly)")
+                        help="Disable reranking")
     parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B")
     parser.add_argument("--reranker_candidate_top_k", type=int, default=30)
     parser.add_argument("--reranker_batch_size", type=int, default=16)
@@ -226,12 +227,13 @@ def main():
         max_workers=args.max_workers,
         chunk_token_size=args.chunk_size,
         chunk_overlap_token_size=args.chunk_overlap,
-        passage_ratio=args.passage_ratio,
-        diffusion_alpha=args.diffusion_alpha,
-        diffusion_max_iter=args.diffusion_max_iter,
-        convergence_tol=args.convergence_tol,
         semantic_unit_percentile=args.semantic_unit_percentile,
-        diffusion_top_k=args.diffusion_top_k,
+        expansion_max_hops=args.expansion_max_hops,
+        expansion_top_k=args.expansion_top_k,
+        hop_decay=args.hop_decay,
+        conductance_floor=args.conductance_floor,
+        conductance_gamma=args.conductance_gamma,
+        scoring_lambda=args.scoring_lambda,
         use_reranker=not args.no_rerank,
         reranker_model_name=args.reranker_model,
         reranker_candidate_top_k=args.reranker_candidate_top_k,

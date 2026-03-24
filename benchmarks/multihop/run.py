@@ -37,11 +37,11 @@ def parse_arguments():
     parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
     parser.add_argument("--llm_model", type=str, default="gpt-4o-mini", help="The LLM model to use")
     parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
-    parser.add_argument("--passage_ratio", type=float, default=2, help="The ratio for passage")
-    parser.add_argument("--diffusion_alpha", type=float, default=0.85, help="Diffusion weight (higher=more exploration)")
-    parser.add_argument("--diffusion_max_iter", type=int, default=10, help="Max iterations for diffusion convergence")
-    parser.add_argument("--convergence_tol", type=float, default=1e-4, help="L2 norm convergence threshold for diffusion")
-    parser.add_argument("--diffusion_top_k", type=int, default=10, help="Activate top-K entities per diffusion round")
+    parser.add_argument("--ner_backend", type=str, default="spacy", choices=["gliner", "spacy"], help="NER backend")
+    parser.add_argument("--expansion_max_hops", type=int, default=3, help="Max BFS hops from seed entities")
+    parser.add_argument("--expansion_top_k", type=int, default=15, help="New entities discovered per hop")
+    parser.add_argument("--hop_decay", type=float, default=0.5, help="Score decay per hop")
+    parser.add_argument("--scoring_lambda", type=float, default=0.7, help="Dual-channel fusion weight")
     parser.add_argument("--reranker_model", type=str, default="Qwen/Qwen3-Reranker-4B", help="Local or Hub path for the reranker model")
     parser.add_argument("--reranker_candidate_top_k", type=int, default=30, help="How many retrieval candidates to pass into the reranker")
     parser.add_argument("--reranker_batch_size", type=int, default=16, help="Batch size for reranker scoring")
@@ -104,11 +104,11 @@ def main():
         embedding_model_name=args.embedding_model,
         spacy_model=args.spacy_model,
         max_workers=args.max_workers,
-        passage_ratio=args.passage_ratio,
-        diffusion_alpha=args.diffusion_alpha,
-        diffusion_max_iter=args.diffusion_max_iter,
-        convergence_tol=args.convergence_tol,
-        diffusion_top_k=args.diffusion_top_k,
+        ner_backend=args.ner_backend,
+        expansion_max_hops=args.expansion_max_hops,
+        expansion_top_k=args.expansion_top_k,
+        hop_decay=args.hop_decay,
+        scoring_lambda=args.scoring_lambda,
         reranker_model_name=args.reranker_model,
         reranker_candidate_top_k=args.reranker_candidate_top_k,
         reranker_batch_size=args.reranker_batch_size,

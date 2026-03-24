@@ -3,8 +3,7 @@
 Vertices  = entities
 Hyperedges = semantic units (each hyperedge connects all entities that co-occur in one SU)
 
-Algorithm: instead of spectral diffusion (which converges to a fixed point and
-freezes), we do explicit BFS-like hop-by-hop exploration.  Each hop discovers
+Algorithm: explicit BFS-like hop-by-hop exploration.  Each hop discovers
 NEW entities through query-relevant SUs, then those new entities become the
 frontier for the next hop.
 """
@@ -68,8 +67,7 @@ class Hypergraph:
 def frontier_expansion(config, hypergraph, entity_hash_ids,
                        su_embeddings, question_embedding,
                        seed_entity_indices, seed_entity_hash_ids,
-                       seed_entity_scores, node_name_to_vertex_idx,
-                       graph_node_count):
+                       seed_entity_scores):
     """Hop-wise frontier expansion on a hypergraph.
 
     Each hop:
@@ -80,19 +78,17 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
                        w[e] × max(frontier_score of frontier entities in e)
       4. Keep top-K new entities; they become the next frontier.
 
-    No degree normalisation (D_v, D_e) is applied — signal flows through
-    SU conductance only, so hub entities are not penalised.
+    Returns:
+        activated_entities: dict of entity_hash_id → (entity_idx, score, 1)
     """
     device = hypergraph.device
     num_vertices = hypergraph.num_vertices
     num_hyperedges = hypergraph.num_hyperedges
-    entity_weights = np.zeros(graph_node_count)
-    top_k = config.diffusion_top_k
-    max_hops = config.diffusion_max_hops
+    top_k = config.expansion_top_k
+    max_hops = config.expansion_max_hops
     hop_decay = config.hop_decay
 
-    H = hypergraph.H            # (|V|, |E|) sparse
-    H_t = H.t()                 # (|E|, |V|) sparse
+    H = hypergraph.H
 
     # ── Phase A: Query-conditioned SU conductance ──
     question_emb = (question_embedding.reshape(-1, 1)
@@ -104,7 +100,7 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
     floor = config.conductance_floor
     gamma = config.conductance_gamma
     w_base = torch.clamp(w_q - floor, min=0) / max(1.0 - floor, 1e-8)
-    w_conductance = w_base.pow(gamma)                       # (|E|,)
+    w_conductance = w_base.pow(gamma)
 
     num_active = int((w_conductance > 0).sum().item())
     logger.info(
@@ -113,7 +109,6 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
     )
 
     # ── Phase B: Initialise seeds ──
-    # activated: entity_idx → score
     activated = {}
     for idx, score in zip(seed_entity_indices, seed_entity_scores):
         activated[idx] = float(score)
@@ -122,9 +117,9 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
 
     # Precompute COO structure once
     H_coo = H.coalesce()
-    h_indices = H_coo.indices()   # (2, nnz)
-    h_v_idx = h_indices[0]        # vertex indices for each edge
-    h_e_idx = h_indices[1]        # hyperedge indices for each edge
+    h_indices = H_coo.indices()
+    h_v_idx = h_indices[0]
+    h_e_idx = h_indices[1]
 
     # ── Phase C: Hop-by-hop frontier expansion ──
     for hop in range(1, max_hops + 1):
@@ -136,22 +131,19 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
         for idx in frontier:
             frontier_scores[idx] = activated[idx]
 
-        # 2) For each COO entry (v, e), if v is in frontier, record score into SU e
-        #    Then take max per SU → max frontier score per SU
-        is_frontier = frontier_scores[h_v_idx] > 0                   # (nnz,) bool
-        frontier_signal = torch.where(is_frontier, frontier_scores[h_v_idx], torch.tensor(0.0, device=device))
-
-        # Scatter max: for each hyperedge, find the max frontier score
+        # 2) Scatter max frontier scores to SUs via COO
+        is_frontier = frontier_scores[h_v_idx] > 0
+        frontier_signal = torch.where(is_frontier, frontier_scores[h_v_idx],
+                                       torch.tensor(0.0, device=device))
         max_frontier_per_su = torch.zeros(num_hyperedges, device=device)
         max_frontier_per_su.scatter_reduce_(0, h_e_idx, frontier_signal, reduce="amax")
 
-        # 3) Bridge score = conductance × max frontier score (only for active SUs)
-        bridge_scores = w_conductance * max_frontier_per_su                  # (|E|,)
+        # 3) Bridge score = conductance × max frontier score
+        bridge_scores = w_conductance * max_frontier_per_su
 
-        # 4) For each COO entry (v, e), propagate bridge_scores[e] to vertex v
-        #    Then scatter max to get candidate score per vertex
+        # 4) Scatter max bridge scores to candidate entities via COO
         candidate_scores = torch.full((num_vertices,), -1.0, device=device)
-        edge_bridge = bridge_scores[h_e_idx]                                 # (nnz,)
+        edge_bridge = bridge_scores[h_e_idx]
         candidate_scores.scatter_reduce_(0, h_v_idx, edge_bridge, reduce="amax")
 
         # Zero out already-activated entities
@@ -171,11 +163,11 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
 
         decay = hop_decay ** hop
         new_frontier = set()
-        for idx, score in zip(top_idx.cpu().tolist(), top_vals.cpu().tolist()):
-            if score <= 0:
+        for idx_t, val_t in zip(top_idx.cpu().tolist(), top_vals.cpu().tolist()):
+            if val_t <= 0:
                 break
-            activated[idx] = score * decay
-            new_frontier.add(idx)
+            activated[idx_t] = val_t * decay
+            new_frontier.add(idx_t)
 
         logger.debug(
             "Hop %d: %d new entities (top score=%.4f, decay=%.3f), "
@@ -196,15 +188,10 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
     activated_entities = {}
     for idx, hash_id, score in zip(seed_entity_indices, seed_entity_hash_ids, seed_entity_scores):
         activated_entities[hash_id] = (idx, score, 1)
-        if hash_id in node_name_to_vertex_idx:
-            entity_weights[node_name_to_vertex_idx[hash_id]] = score
 
     for entity_idx, score in activated.items():
         hash_id = entity_hash_ids[entity_idx]
         if hash_id not in activated_entities:
             activated_entities[hash_id] = (entity_idx, score, 1)
-        if hash_id in node_name_to_vertex_idx:
-            node_idx = node_name_to_vertex_idx[hash_id]
-            entity_weights[node_idx] = max(entity_weights[node_idx], score)
 
-    return entity_weights, activated_entities
+    return activated_entities
