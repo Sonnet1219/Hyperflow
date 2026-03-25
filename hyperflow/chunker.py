@@ -179,20 +179,119 @@ def kamradt_semantic_units(sentences, embeddings, percentile=60):
     return units
 
 
-def create_semantic_units(chunk_text, nlp_model, embedding_model, percentile=60):
+def _balance_semantic_units(groups, sentences, embeddings, min_words, max_words):
+    """Balance SU lengths by merging short units and splitting long ones.
+
+    Pass 1 – Merge: repeatedly find the shortest SU (< min_words) and merge it
+             with its more semantically similar neighbor.
+    Pass 2 – Split: for any SU exceeding max_words, cut at the internal sentence
+             boundary with the largest semantic gap; recurse if needed.
+
+    Args:
+        groups: list of lists of sentence indices (from Kamradt)
+        sentences: list of sentence strings
+        embeddings: normalized sentence embeddings (numpy array)
+        min_words: minimum word count per SU
+        max_words: maximum word count per SU
+
+    Returns:
+        list of lists of sentence indices (balanced groups)
     """
-    Split a chunk into semantic units using Kamradt Percentile method.
+
+    def _word_count(group):
+        return sum(len(sentences[i].split()) for i in group)
+
+    def _group_embedding(group):
+        emb = np.mean(embeddings[group], axis=0)
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 1e-8 else emb
+
+    def _similarity(group_a, group_b):
+        return float(np.dot(_group_embedding(group_a), _group_embedding(group_b)))
+
+    # ── Pass 1: Merge short SUs ──
+    while True:
+        # Find the shortest SU below min_words
+        shortest_idx = -1
+        shortest_wc = min_words  # only merge if strictly below
+        for i, g in enumerate(groups):
+            wc = _word_count(g)
+            if wc < shortest_wc:
+                shortest_wc = wc
+                shortest_idx = i
+        if shortest_idx == -1:
+            break
+
+        # Decide merge direction by semantic similarity
+        left_sim = (_similarity(groups[shortest_idx - 1], groups[shortest_idx])
+                    if shortest_idx > 0 else -1.0)
+        right_sim = (_similarity(groups[shortest_idx], groups[shortest_idx + 1])
+                     if shortest_idx < len(groups) - 1 else -1.0)
+
+        if left_sim >= right_sim and left_sim > -1.0:
+            # Merge into left neighbor
+            groups[shortest_idx - 1] = groups[shortest_idx - 1] + groups[shortest_idx]
+            groups.pop(shortest_idx)
+        elif right_sim > -1.0:
+            # Merge into right neighbor
+            groups[shortest_idx] = groups[shortest_idx] + groups[shortest_idx + 1]
+            groups.pop(shortest_idx + 1)
+        else:
+            break  # single SU left, nothing to merge
+
+    # ── Pass 2: Split long SUs ──
+    def _split_group(group):
+        if _word_count(group) <= max_words or len(group) <= 1:
+            return [group]
+
+        # Find internal sentence boundary with largest semantic gap
+        best_dist = -1.0
+        best_pos = -1
+        for i in range(len(group) - 1):
+            # Check that neither half would be below min_words
+            left_half = group[:i + 1]
+            right_half = group[i + 1:]
+            if _word_count(left_half) < min_words or _word_count(right_half) < min_words:
+                continue
+            dist = 1.0 - float(np.dot(embeddings[group[i]], embeddings[group[i + 1]]))
+            if dist > best_dist:
+                best_dist = dist
+                best_pos = i
+
+        if best_pos == -1:
+            # Cannot split without violating min_words, accept as-is
+            return [group]
+
+        left = group[:best_pos + 1]
+        right = group[best_pos + 1:]
+        return _split_group(left) + _split_group(right)
+
+    balanced = []
+    for g in groups:
+        balanced.extend(_split_group(g))
+
+    return balanced
+
+
+def create_semantic_units(chunk_text, nlp_model, embedding_model, percentile=60,
+                          min_words=20, max_words=200):
+    """
+    Split a chunk into semantic units using Kamradt Percentile method,
+    then balance SU lengths to stay within [min_words, max_words].
 
     1. Extract sentences via spaCy
     2. Embed sentences with BGE
     3. Run Kamradt to group adjacent sentences
-    4. Return list of semantic unit texts
+    4. Balance: merge short SUs into neighbors, split long SUs at semantic gaps
+    5. Return list of semantic unit texts
 
     Args:
         chunk_text: Text of a single chunk (~1200 tokens)
         nlp_model: Loaded spaCy model for sentence segmentation
         embedding_model: SentenceTransformer model for embeddings
         percentile: Kamradt breakpoint percentile (default 60)
+        min_words: Minimum word count per SU (default 20)
+        max_words: Maximum word count per SU (default 200)
 
     Returns:
         list[str]: List of semantic unit texts (each is 1+ joined sentences)
@@ -213,6 +312,9 @@ def create_semantic_units(chunk_text, nlp_model, embedding_model, percentile=60)
 
     # Run Kamradt grouping
     groups = kamradt_semantic_units(sentences, embeddings, percentile)
+
+    # Balance SU lengths
+    groups = _balance_semantic_units(groups, sentences, embeddings, min_words, max_words)
 
     # Join sentences in each group into a semantic unit text
     su_texts = []
