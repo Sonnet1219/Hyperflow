@@ -1,8 +1,11 @@
 from copy import deepcopy
 from hyperflow.utils import compute_mdhash_id
-import numpy as np
 import pandas as pd
 import os
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class EmbeddingStore:
     def __init__(self, embedding_model, db_filename, batch_size, namespace):
@@ -30,7 +33,7 @@ class EmbeddingStore:
             self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
             self.hash_id_to_text = {h: t for h, t in zip(self.hash_ids, self.texts)}
             self.text_to_hash_id = {t: h for t, h in zip(self.texts, self.hash_ids)}
-            print(f"[{self.namespace}] Loaded {len(self.hash_ids)} records from {self.db_filename}")
+            logger.info("[%s] Loaded %d records from %s", self.namespace, len(self.hash_ids), self.db_filename)
 
     def insert_text(self, text_list):
         nodes_dict = {}
@@ -42,18 +45,20 @@ class EmbeddingStore:
         existing = set(self.hash_ids)
         missing_ids = [h for h in all_hash_ids if h not in existing]
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
-        all_embeddings = self.embedding_model.encode(texts_to_encode,normalize_embeddings=True, show_progress_bar=False,batch_size=self.batch_size)
+        all_embeddings = self.embedding_model.encode(texts_to_encode, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
 
         self._upsert(missing_ids, texts_to_encode, all_embeddings)
 
     def _upsert(self, hash_ids, texts, embeddings):
+        base_idx = len(self.hash_ids)
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
         self.embeddings.extend(embeddings)
 
-        self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
-        self.hash_id_to_text = {h: t for h, t in zip(self.hash_ids, self.texts)}
-        self.text_to_hash_id = {t: h for t, h in zip(self.texts, self.hash_ids)}
+        for i, (h, t) in enumerate(zip(hash_ids, texts)):
+            self.hash_id_to_idx[h] = base_idx + i
+            self.hash_id_to_text[h] = t
+            self.text_to_hash_id[t] = h
 
         self._save_data()
 
@@ -68,14 +73,3 @@ class EmbeddingStore:
 
     def get_hash_id_to_text(self):
         return deepcopy(self.hash_id_to_text)
-
-    def encode_texts(self, texts):
-        return self.embedding_model.encode(texts, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
-
-    def get_embeddings(self, hash_ids):
-        if not hash_ids:
-            return np.array([])
-        indices = np.array([self.hash_id_to_idx[h] for h in hash_ids], dtype=np.intp)
-        embeddings = np.array(self.embeddings)[indices]
-        return embeddings
-

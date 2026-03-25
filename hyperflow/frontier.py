@@ -15,59 +15,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class Hypergraph:
-    """Sparse hypergraph backed by an incidence matrix H.
-
-    H[v, e] = 1  iff vertex v belongs to hyperedge e.
-    """
-
-    def __init__(self, entity_hash_id_to_su_hash_ids,
-                 entity_embedding_store, su_embedding_store, device):
-        self.device = device
-        self.num_vertices = len(entity_embedding_store.hash_id_to_text)
-        self.num_hyperedges = len(su_embedding_store.hash_id_to_text)
-
-        # Build incidence matrix H  (|V| x |E|)
-        indices = []
-        for entity_hash_id, su_hash_ids in entity_hash_id_to_su_hash_ids.items():
-            v_idx = entity_embedding_store.hash_id_to_idx[entity_hash_id]
-            for su_hash_id in su_hash_ids:
-                e_idx = su_embedding_store.hash_id_to_idx[su_hash_id]
-                indices.append([v_idx, e_idx])
-
-        if indices:
-            idx_tensor = torch.tensor(indices, dtype=torch.long).t()
-            val_tensor = torch.ones(idx_tensor.shape[1], dtype=torch.float32)
-            self.H = torch.sparse_coo_tensor(
-                idx_tensor, val_tensor,
-                (self.num_vertices, self.num_hyperedges), device=device,
-            ).coalesce()
-        else:
-            self.H = torch.sparse_coo_tensor(
-                torch.zeros((2, 0), dtype=torch.long),
-                torch.zeros(0, dtype=torch.float32),
-                (self.num_vertices, self.num_hyperedges), device=device,
-            )
-
-        nnz = self.H._nnz()
-        ones_e = torch.ones(self.num_hyperedges, 1, device=device)
-        d_v = torch.sparse.mm(self.H, ones_e).squeeze()
-        ones_v = torch.ones(self.num_vertices, 1, device=device)
-        d_e = torch.sparse.mm(self.H.t(), ones_v).squeeze()
-
-        logger.info(
-            "Hypergraph built: %d vertices, %d hyperedges, nnz=%d, "
-            "sparsity=%.2f%%, D_v range [%.0f, %.0f], D_e range [%.0f, %.0f]",
-            self.num_vertices, self.num_hyperedges, nnz,
-            (1 - nnz / max(self.num_vertices * self.num_hyperedges, 1)) * 100,
-            d_v.min(), d_v.max(), d_e.min(), d_e.max(),
-        )
+def _compute_conductance(su_embeddings, query_emb, floor, gamma, device):
+    """Compute SU conductance weights from a query embedding."""
+    su_sims = np.dot(su_embeddings, query_emb).flatten()
+    w_q = torch.from_numpy(su_sims).float().to(device).clamp(min=0)
+    w_base = torch.clamp(w_q - floor, min=0) / max(1.0 - floor, 1e-8)
+    return w_base.pow(gamma)
 
 
 def frontier_expansion(config, hypergraph, entity_hash_ids,
                        su_embeddings, question_embedding,
                        seed_entity_indices, seed_entity_hash_ids,
-                       seed_entity_scores):
+                       seed_entity_scores,
+                       entity_embeddings=None):
     """Hop-wise frontier expansion on a hypergraph.
 
     Each hop:
@@ -77,9 +37,16 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
             score(v) = max over reachable SUs e containing v:
                        w[e] × max(frontier_score of frontier entities in e)
       4. Keep top-K new entities; they become the next frontier.
+      5. (Progressive Steering) Update query embedding using top-K activated
+         entity centroid, then recompute conductance for the next hop.
+
+    Args:
+        entity_embeddings: numpy array (num_entities, dim). Required for
+            progressive steering (steering_alpha < 1.0). If None or
+            steering_alpha == 1.0, steering is disabled.
 
     Returns:
-        activated_entities: dict of entity_hash_id → (entity_idx, score, 1)
+        activated_entities: dict of entity_hash_id → (entity_idx, score)
     """
     device = hypergraph.device
     num_vertices = hypergraph.num_vertices
@@ -87,26 +54,31 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
     top_k = config.expansion_top_k
     max_hops = config.expansion_max_hops
     hop_decay = config.hop_decay
+    floor = config.conductance_floor
+    gamma = config.conductance_gamma
+
+    # Steering parameters
+    alpha = config.steering_alpha
+    steering_top_k = config.steering_top_k
+    use_steering = alpha < 1.0 and entity_embeddings is not None
 
     H = hypergraph.H
 
-    # ── Phase A: Query-conditioned SU conductance ──
-    question_emb = (question_embedding.reshape(-1, 1)
-                    if len(question_embedding.shape) == 1
-                    else question_embedding)
-    su_sims = np.dot(su_embeddings, question_emb).flatten()
-    w_q = torch.from_numpy(su_sims).float().to(device).clamp(min=0)
+    # ── Phase A: Initial query-conditioned SU conductance ──
+    q_original = (question_embedding.reshape(-1, 1)
+                  if len(question_embedding.shape) == 1
+                  else question_embedding)
+    q_current = q_original
 
-    floor = config.conductance_floor
-    gamma = config.conductance_gamma
-    w_base = torch.clamp(w_q - floor, min=0) / max(1.0 - floor, 1e-8)
-    w_conductance = w_base.pow(gamma)
+    w_conductance = _compute_conductance(su_embeddings, q_current, floor, gamma, device)
 
     num_active = int((w_conductance > 0).sum().item())
     logger.info(
         "Conductance (floor=%.2f, gamma=%.2f): %d/%d active SUs, %d suppressed",
         floor, gamma, num_active, num_hyperedges, num_hyperedges - num_active,
     )
+    if use_steering:
+        logger.info("Progressive steering enabled: alpha=%.2f, top_k=%d", alpha, steering_top_k)
 
     # ── Phase B: Initialise seeds ──
     activated = {}
@@ -179,6 +151,33 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
 
         frontier = new_frontier
 
+        # ── Progressive Query Steering ──
+        # After discovering new entities, steer the query toward what was found
+        # so the next hop's conductance favours SUs relevant to the evolving topic.
+        if use_steering and frontier:
+            # Take top-K activated entities (excluding seeds) by score
+            non_seed = {idx: sc for idx, sc in activated.items()
+                        if idx not in set(seed_entity_indices)}
+            if non_seed:
+                sorted_ents = sorted(non_seed.items(), key=lambda x: x[1], reverse=True)
+                top_ent_indices = [idx for idx, _ in sorted_ents[:steering_top_k]]
+                centroid = np.mean(entity_embeddings[top_ent_indices], axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 1e-8:
+                    centroid = centroid / norm
+                    q_steered = alpha * q_original.flatten() + (1 - alpha) * centroid
+                    q_steered = q_steered / (np.linalg.norm(q_steered) + 1e-8)
+                    q_current = q_steered.reshape(-1, 1)
+
+                    w_conductance = _compute_conductance(
+                        su_embeddings, q_current, floor, gamma, device
+                    )
+                    new_active = int((w_conductance > 0).sum().item())
+                    logger.debug(
+                        "Steering after hop %d: %d active SUs (was %d)",
+                        hop, new_active, num_active,
+                    )
+
     logger.info(
         "Frontier expansion finished: %d hops, %d activated entities",
         min(hop, max_hops) if frontier else hop - 1, len(activated),
@@ -187,11 +186,11 @@ def frontier_expansion(config, hypergraph, entity_hash_ids,
     # ── Phase D: Collect results ──
     activated_entities = {}
     for idx, hash_id, score in zip(seed_entity_indices, seed_entity_hash_ids, seed_entity_scores):
-        activated_entities[hash_id] = (idx, score, 1)
+        activated_entities[hash_id] = (idx, score)
 
     for entity_idx, score in activated.items():
         hash_id = entity_hash_ids[entity_idx]
         if hash_id not in activated_entities:
-            activated_entities[hash_id] = (entity_idx, score, 1)
+            activated_entities[hash_id] = (entity_idx, score)
 
     return activated_entities

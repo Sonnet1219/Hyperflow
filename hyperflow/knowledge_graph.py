@@ -2,11 +2,60 @@
 
 import re
 import numpy as np
+import torch
 from collections import defaultdict
-from hyperflow.frontier import Hypergraph
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class Hypergraph:
+    """Sparse hypergraph backed by an incidence matrix H.
+
+    H[v, e] = 1  iff vertex v belongs to hyperedge e.
+    """
+
+    def __init__(self, entity_hash_id_to_su_hash_ids,
+                 entity_embedding_store, su_embedding_store, device):
+        self.device = device
+        self.num_vertices = len(entity_embedding_store.hash_id_to_text)
+        self.num_hyperedges = len(su_embedding_store.hash_id_to_text)
+
+        # Build incidence matrix H  (|V| x |E|)
+        indices = []
+        for entity_hash_id, su_hash_ids in entity_hash_id_to_su_hash_ids.items():
+            v_idx = entity_embedding_store.hash_id_to_idx[entity_hash_id]
+            for su_hash_id in su_hash_ids:
+                e_idx = su_embedding_store.hash_id_to_idx[su_hash_id]
+                indices.append([v_idx, e_idx])
+
+        if indices:
+            idx_tensor = torch.tensor(indices, dtype=torch.long).t()
+            val_tensor = torch.ones(idx_tensor.shape[1], dtype=torch.float32)
+            self.H = torch.sparse_coo_tensor(
+                idx_tensor, val_tensor,
+                (self.num_vertices, self.num_hyperedges), device=device,
+            ).coalesce()
+        else:
+            self.H = torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.long),
+                torch.zeros(0, dtype=torch.float32),
+                (self.num_vertices, self.num_hyperedges), device=device,
+            )
+
+        nnz = self.H._nnz()
+        ones_e = torch.ones(self.num_hyperedges, 1, device=device)
+        d_v = torch.sparse.mm(self.H, ones_e).squeeze()
+        ones_v = torch.ones(self.num_vertices, 1, device=device)
+        d_e = torch.sparse.mm(self.H.t(), ones_v).squeeze()
+
+        logger.info(
+            "Hypergraph built: %d vertices, %d hyperedges, nnz=%d, "
+            "sparsity=%.2f%%, D_v range [%.0f, %.0f], D_e range [%.0f, %.0f]",
+            self.num_vertices, self.num_hyperedges, nnz,
+            (1 - nnz / max(self.num_vertices * self.num_hyperedges, 1)) * 100,
+            d_v.min(), d_v.max(), d_e.min(), d_e.max(),
+        )
 
 
 class KnowledgeGraph:

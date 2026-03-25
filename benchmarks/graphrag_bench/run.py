@@ -1,11 +1,10 @@
 """Run Hyperflow on GraphRAG-Bench benchmark.
 
 Pipeline:
-  1. Load corpus & questions from local HuggingFace cache
-  2. Chunk corpus -> Build hypergraph index
-  3. Retrieve + QA for each question
-  4. Save predictions in official unified JSON format
-  5. Run official Evaluation scripts (generation_eval + retrieval_eval)
+  1. Load corpus entries & questions from local HuggingFace cache
+  2. For each corpus entry: chunk -> index -> retrieve + QA for matching questions
+  3. Save predictions in official unified JSON format
+  4. Run official Evaluation scripts (generation_eval + retrieval_eval)
 """
 
 import argparse
@@ -14,12 +13,15 @@ import os
 import subprocess
 import sys
 import warnings
+from collections import defaultdict
 from datetime import datetime
+from dotenv import load_dotenv
 
 # Ensure project root is on sys.path so `hyperflow` is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-from hyperflow.config import get_gliner_labels_for_corpus
+from hyperflow.ner import get_gliner_labels_for_corpus
 from hyperflow.engine import Hyperflow
 from hyperflow.chunker import chunk_corpus_by_tokens
 from hyperflow.utils import setup_logging
@@ -46,7 +48,7 @@ def parse_arguments():
 
     # --- Models ---
     parser.add_argument("--embedding_model", type=str, default="BAAI/bge-large-en-v1.5")
-    parser.add_argument("--llm_model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--llm_model", type=str, default=os.getenv("LLM_MODEL_NAME", "gpt-4o-mini"))
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf")
 
     # --- NER ---
@@ -58,11 +60,11 @@ def parse_arguments():
     # --- Chunking ---
     parser.add_argument("--chunk_size", type=int, default=1200, help="Token size for corpus chunking")
     parser.add_argument("--chunk_overlap", type=int, default=100, help="Token overlap between chunks")
-    parser.add_argument("--semantic_unit_percentile", type=int, default=80,
+    parser.add_argument("--semantic_unit_percentile", type=int, default=60,
                         help="Kamradt percentile for semantic unit boundary detection")
 
     # --- Retrieval ---
-    parser.add_argument("--max_workers", type=int, default=16)
+    parser.add_argument("--max_workers", type=int, default=int(os.getenv("MAX_WORKERS", "16")))
     parser.add_argument("--expansion_max_hops", type=int, default=3, help="Max BFS hops from seed entities")
     parser.add_argument("--expansion_top_k", type=int, default=15, help="New entities discovered per hop")
     parser.add_argument("--hop_decay", type=float, default=0.5, help="Score decay per hop")
@@ -198,87 +200,123 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     setup_logging(f"{output_dir}/log.txt")
 
-    # Load corpus and chunk it
-    corpus_text = load_corpus(args.corpus_name)
-    chunks = chunk_corpus_by_tokens(corpus_text, args.chunk_size, args.chunk_overlap)
-    passages = [f"{idx}:{chunk}" for idx, chunk in enumerate(chunks)]
-    print(f"Corpus chunked into {len(passages)} passages "
-          f"({args.chunk_size} tokens, {args.chunk_overlap} overlap)")
+    # Load corpus entries and questions
+    corpus_entries = load_corpus(args.corpus_name)
+    all_questions = load_questions(args.corpus_name)
 
-    # Load questions
-    questions = load_questions(args.corpus_name)
+    # Filter question types
     if args.question_types is not None:
         allowed = set(args.question_types)
-        questions = [q for q in questions if q.get("question_type") in allowed]
+        all_questions = [q for q in all_questions if q.get("question_type") in allowed]
         print(f"Filtered to question types: {args.question_types}")
-    if args.question_limit is not None:
-        questions = questions[:args.question_limit]
-    print(f"Loaded {len(questions)} questions")
 
-    # Set up GLiNER labels based on corpus
+    # Apply question limit
+    if args.question_limit is not None:
+        all_questions = all_questions[:args.question_limit]
+    print(f"Total questions to process: {len(all_questions)}")
+
+    # Group questions by source -> corpus_name
+    questions_by_source = defaultdict(list)
+    for q in all_questions:
+        questions_by_source[q["source"]].append(q)
+
+    # Map corpus_name -> corpus entry
+    corpus_by_name = {entry["corpus_name"]: entry["context"] for entry in corpus_entries}
+
+    # Find which corpus entries have matching questions
+    sources_needed = set(questions_by_source.keys())
+    sources_available = set(corpus_by_name.keys())
+    missing = sources_needed - sources_available
+    if missing:
+        print(f"WARNING: Questions reference unknown sources: {missing}")
+
     gliner_labels = get_gliner_labels_for_corpus(args.corpus_name)
 
-    # Create Hyperflow instance
-    model = Hyperflow(
-        save_dir=os.path.join(PROJECT_ROOT, f"index_store/graphrag-bench-{args.corpus_name}"),
-        llm_model_name=args.llm_model,
-        embedding_model_name=args.embedding_model,
-        spacy_model=args.spacy_model,
-        max_workers=args.max_workers,
-        chunk_token_size=args.chunk_size,
-        chunk_overlap_token_size=args.chunk_overlap,
-        semantic_unit_percentile=args.semantic_unit_percentile,
-        expansion_max_hops=args.expansion_max_hops,
-        expansion_top_k=args.expansion_top_k,
-        hop_decay=args.hop_decay,
-        conductance_floor=args.conductance_floor,
-        conductance_gamma=args.conductance_gamma,
-        scoring_lambda=args.scoring_lambda,
-        use_reranker=not args.no_rerank,
-        reranker_model_name=args.reranker_model,
-        reranker_candidate_top_k=args.reranker_candidate_top_k,
-        reranker_batch_size=args.reranker_batch_size,
-        reranker_max_length=args.reranker_max_length,
-        ner_backend=args.ner_backend,
-        gliner_model=args.gliner_model,
-        gliner_threshold=args.gliner_threshold,
-        gliner_labels=gliner_labels,
-    )
+    all_formatted = []
 
-    # Index
-    model.index(passages)
-    print("Indexing complete.")
+    for corpus_name in sorted(sources_needed & sources_available):
+        questions = questions_by_source[corpus_name]
+        corpus_text = corpus_by_name[corpus_name]
+        print(f"\n{'='*60}")
+        print(f"Processing {corpus_name}: {len(questions)} questions, {len(corpus_text)} chars")
+        print(f"{'='*60}")
+
+        # Create Hyperflow instance with per-corpus index
+        model = Hyperflow(
+            save_dir=os.path.join(PROJECT_ROOT, f"index_store/graphrag-bench-{args.corpus_name}/{corpus_name}"),
+            llm_model_name=args.llm_model,
+            embedding_model_name=args.embedding_model,
+            spacy_model=args.spacy_model,
+            max_workers=args.max_workers,
+            chunk_token_size=args.chunk_size,
+            chunk_overlap_token_size=args.chunk_overlap,
+            semantic_unit_percentile=args.semantic_unit_percentile,
+            expansion_max_hops=args.expansion_max_hops,
+            expansion_top_k=args.expansion_top_k,
+            hop_decay=args.hop_decay,
+            conductance_floor=args.conductance_floor,
+            conductance_gamma=args.conductance_gamma,
+            scoring_lambda=args.scoring_lambda,
+            use_reranker=not args.no_rerank,
+            reranker_model_name=args.reranker_model,
+            reranker_candidate_top_k=args.reranker_candidate_top_k,
+            reranker_batch_size=args.reranker_batch_size,
+            reranker_max_length=args.reranker_max_length,
+            ner_backend=args.ner_backend,
+            gliner_model=args.gliner_model,
+            gliner_threshold=args.gliner_threshold,
+            gliner_labels=gliner_labels,
+        )
+
+        # Chunk corpus with semantic boundary awareness
+        chunks = chunk_corpus_by_tokens(
+            corpus_text, args.chunk_size, args.chunk_overlap,
+            nlp_model=model.spacy_ner.spacy_model,
+            embedding_model=model.embedding_model,
+        )
+        passages = list(chunks)
+        print(f"  Chunked into {len(passages)} passages")
+
+        # Index
+        model.index(passages)
+        print(f"  Indexing complete for {corpus_name}.")
+
+        if args.skip_qa:
+            continue
+
+        # QA
+        queries = [q["question"] for q in questions]
+        results = model.rag_qa(queries)
+
+        # Format results
+        legacy_results = []
+        for result, q in zip(results, questions):
+            legacy_results.append({
+                "question": result["query"],
+                "sorted_passage": result["passages"],
+                "pred_answer": result["answer"],
+                "gold_answer": q["answer"],
+            })
+        formatted = format_results(legacy_results, questions)
+        all_formatted.extend(formatted)
+        print(f"  QA complete for {corpus_name}: {len(formatted)} results")
+
+        # Free model to reclaim GPU memory before next corpus
+        import gc
+        del model
+        gc.collect()
+        import torch
+        torch.cuda.empty_cache()
 
     if args.skip_qa:
         print("Skipping QA generation (--skip_qa). Done.")
         return
 
-    # QA
-    queries = [q["question"] for q in questions]
-    results = model.rag_qa(queries)
-
-    # Format and save in official GraphRAG-Bench unified format
-    # Convert to the format expected by format_results
-    legacy_results = []
-    for result, q in zip(results, questions):
-        legacy_results.append({
-            "question": result["query"],
-            "sorted_passage": result["passages"],
-            "pred_answer": result["answer"],
-            "gold_answer": q["answer"],
-        })
-    formatted = format_results(legacy_results, questions)
+    # Save all predictions
     predictions_path = os.path.join(output_dir, "predictions.json")
     with open(predictions_path, "w", encoding="utf-8") as f:
-        json.dump(formatted, f, ensure_ascii=False, indent=2)
-    print(f"Predictions saved to {predictions_path}")
-
-    # Free GPU memory before evaluation (eval loads its own embedding model)
-    import gc
-    del model
-    gc.collect()
-    import torch
-    torch.cuda.empty_cache()
+        json.dump(all_formatted, f, ensure_ascii=False, indent=2)
+    print(f"\nPredictions saved to {predictions_path} ({len(all_formatted)} total)")
 
     # Run official evaluation
     if not args.skip_eval:

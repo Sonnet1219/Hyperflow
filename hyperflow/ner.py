@@ -1,6 +1,5 @@
 import logging
 import re
-from collections import defaultdict
 
 import spacy
 
@@ -10,49 +9,48 @@ from hyperflow.entity_normalization import EntityNormalizer, normalize_entity_li
 logger = logging.getLogger(__name__)
 
 
+MEDICAL_GLINER_LABELS = (
+    "disease or cancer type",
+    "disease abbreviation",
+    "symptom or clinical sign",
+    "risk factor or exposure",
+    "anatomy or body site",
+    "diagnostic test or imaging",
+    "pathology finding or histology",
+    "stage or grade",
+    "treatment or procedure",
+    "drug or regimen",
+    "biomarker or receptor",
+    "gene or mutation",
+)
+
+NOVEL_GLINER_LABELS = (
+    "person",
+    "civilization",
+    "location",
+    "artifact",
+    "deity",
+    "language",
+    "historical event",
+    "ancient text or scripture",
+    "symbol or totem",
+    "architectural structure",
+)
+
+
+def get_gliner_labels_for_corpus(corpus_name: str) -> list[str]:
+    normalized_name = corpus_name.lower()
+    if "novel" in normalized_name:
+        return list(NOVEL_GLINER_LABELS)
+    return list(MEDICAL_GLINER_LABELS)
+
+
 class SpacyNER:
     def __init__(self, spacy_model):
-        spacy.require_gpu()
+        spacy.prefer_gpu()
         self.spacy_model = spacy.load(spacy_model)
         self.normalizer = EntityNormalizer(self.spacy_model)
         logger.info("spaCy NER loaded with model: %s (GPU enabled)", spacy_model)
-
-    def batch_ner(self, hash_id_to_passage, max_workers):
-        passage_list = list(hash_id_to_passage.values())
-        batch_size = max(1, len(passage_list) // max_workers)
-        logger.info(
-            "Running spaCy NER on %s passages with batch_size=%s and max_workers=%s",
-            len(passage_list),
-            batch_size,
-            max_workers,
-        )
-        docs_list = self.spacy_model.pipe(passage_list, batch_size=batch_size)
-        passage_hash_id_to_entities = {}
-        su_to_entities = defaultdict(list)
-        for idx, doc in enumerate(docs_list):
-            passage_hash_id = list(hash_id_to_passage.keys())[idx]
-            single_passage_hash_id_to_entities, single_su_to_entities = self.extract_entities_and_semantic_units(doc, passage_hash_id)
-            passage_hash_id_to_entities.update(single_passage_hash_id_to_entities)
-            for su, ents in single_su_to_entities.items():
-                for e in ents:
-                    if e not in su_to_entities[su]:
-                        su_to_entities[su].append(e)
-        return passage_hash_id_to_entities, su_to_entities
-
-    def extract_entities_and_semantic_units(self, doc, passage_hash_id):
-        su_to_entities = defaultdict(list)
-        unique_entities = set()
-        passage_hash_id_to_entities = {}
-        for ent in doc.ents:
-            if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
-                continue
-            sent_text = ent.sent.text
-            ent_text = self.normalizer.canonicalize(ent.text.lower())
-            if ent_text not in su_to_entities[sent_text]:
-                su_to_entities[sent_text].append(ent_text)
-            unique_entities.add(ent_text)
-        passage_hash_id_to_entities[passage_hash_id] = list(unique_entities)
-        return passage_hash_id_to_entities, su_to_entities
 
     def extract_entities_from_text(self, text):
         """Extract entities from a single text string (semantic unit)."""

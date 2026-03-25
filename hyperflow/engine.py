@@ -8,7 +8,7 @@ from hyperflow.reranker import QwenReranker
 from hyperflow.chunker import create_semantic_units
 from hyperflow.frontier import frontier_expansion
 from hyperflow.knowledge_graph import KnowledgeGraph, dense_retrieval
-from hyperflow.utils import LLM_Model
+from hyperflow.utils import LLM_Model, compute_mdhash_id
 
 import os
 import json
@@ -185,18 +185,33 @@ class Hyperflow:
             with open(self._ner_cache_path) as f:
                 cached = json.load(f)
             cached_passage_entities = cached["passage_hash_id_to_entities"]
-            cached_su_entities = cached.get("su_to_entities",
-                                            cached.get("sentence_to_entities", {}))
+            raw_su = cached.get("su_to_entities",
+                                cached.get("sentence_to_entities", {}))
+            # Convert hash_id keys back to text keys using su_embedding_store
+            hid_to_text = self.su_embedding_store.hash_id_to_text
+            cached_su_entities = {}
+            for key, entities in raw_su.items():
+                if key in hid_to_text:
+                    # Key is a hash_id — resolve to text
+                    cached_su_entities[hid_to_text[key]] = entities
+                else:
+                    # Legacy format: key is already text
+                    cached_su_entities[key] = entities
             uncached_ids = set(passage_hash_ids) - set(cached_passage_entities.keys())
             return cached_passage_entities, cached_su_entities, uncached_ids
         return {}, {}, set(passage_hash_ids)
 
     def _persist_ner_data(self, passage_entities, su_entities):
+        # Store su_to_entities with hash_id keys instead of full text
+        su_by_hash = {}
+        for su_text, entities in su_entities.items():
+            su_hash_id = compute_mdhash_id(su_text, prefix="su-")
+            su_by_hash[su_hash_id] = entities
         os.makedirs(os.path.dirname(self._ner_cache_path), exist_ok=True)
         with open(self._ner_cache_path, "w") as f:
             json.dump({
                 "passage_hash_id_to_entities": passage_entities,
-                "su_to_entities": su_entities,
+                "su_to_entities": su_by_hash,
             }, f)
 
     # ====== Retrieval ======
@@ -350,6 +365,7 @@ class Hyperflow:
             seed_entity_indices=seed_indices,
             seed_entity_hash_ids=seed_hash_ids,
             seed_entity_scores=seed_scores,
+            entity_embeddings=self._entity_embeddings,
         )
 
         # Channel 1: Dense semantic similarity

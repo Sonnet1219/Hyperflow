@@ -1,39 +1,6 @@
 from dataclasses import dataclass, field
 
-
-MEDICAL_GLINER_LABELS = (
-    "disease or cancer type",
-    "disease abbreviation",
-    "symptom or clinical sign",
-    "risk factor or exposure",
-    "anatomy or body site",
-    "diagnostic test or imaging",
-    "pathology finding or histology",
-    "stage or grade",
-    "treatment or procedure",
-    "drug or regimen",
-    "biomarker or receptor",
-    "gene or mutation",
-)
-
-NOVEL_GLINER_LABELS = (
-    "person",
-    "civilization",
-    "location",
-    "artifact",
-    "deity",
-    "language",
-    "historical event",
-    "organization",
-    "architectural structure",
-)
-
-
-def get_gliner_labels_for_corpus(corpus_name: str) -> list[str]:
-    normalized_name = corpus_name.lower()
-    if "novel" in normalized_name:
-        return list(NOVEL_GLINER_LABELS)
-    return list(MEDICAL_GLINER_LABELS)
+from hyperflow.ner import MEDICAL_GLINER_LABELS
 
 
 @dataclass
@@ -57,8 +24,11 @@ class HyperflowConfig:
     # SU conductance gating
     conductance_floor: float = 0.5          # query-SU sim below this -> zero conductance
     conductance_gamma: float = 1.0          # power exponent (1.0 = linear, < 1 broadens, > 1 sharpens)
+    # Progressive Query Steering
+    steering_alpha: float = 0.7             # retain ratio of original query (1.0 = no steering)
+    steering_top_k: int = 3                 # top-K activated entities for centroid computation
     # Semantic unit chunking
-    semantic_unit_percentile: int = 80      # Kamradt percentile for SU boundary detection
+    semantic_unit_percentile: int = 60      # Kamradt percentile for SU boundary detection
     # Reranker
     use_reranker: bool = True
     reranker_model_name: str = "Qwen/Qwen3-Reranker-4B"

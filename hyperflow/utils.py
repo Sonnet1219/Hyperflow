@@ -5,6 +5,9 @@ import re
 import string
 import logging
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def compute_mdhash_id(content: str, prefix: str = "") -> str:

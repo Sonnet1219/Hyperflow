@@ -1,6 +1,6 @@
 # Hyperflow: Zero-Token Hypergraph Indexing for Single-Step Multi-Hop Retrieval
 
-> Hyperflow turns a document collection into a reasoning-ready indexing hypergraph. Instead of spending large amounts of LLM tokens during offline graph construction, it uses NER-based hyperedge construction and flow-damped hypergraph diffusion to support single-step multi-hop retrieval for complex question answering.
+> Hyperflow turns a document collection into a reasoning-ready hypergraph index. Instead of spending LLM tokens during offline graph construction, it uses NER-based hyperedge construction and frontier expansion to support single-step multi-hop retrieval for complex question answering.
 
 ## Overview
 
@@ -8,115 +8,96 @@ Many existing GraphRAG systems rely on LLMs in the offline indexing stage to ext
 
 Hyperflow is designed to address both issues:
 
-- It builds a retrieval-oriented indexing hypergraph directly from the corpus, without asking an LLM to generate explicit relations one by one.
-- It uses entity recognition and semantic linking to construct hyperedges at almost zero token cost during indexing.
-- At query time, it performs hypergraph spectral diffusion with flow damping, which weakens the influence of hub nodes and activates multiple related evidence chains in one retrieval pass.
-- This enables single-step multi-hop retrieval: instead of retrieving hop by hop, Hyperflow can connect scattered evidence across entities, sentences, and passages in one shot.
-
-In short, Hyperflow aims to be a lower-cost and more robust alternative to LLM-heavy GraphRAG pipelines for multi-hop QA.
+- It builds a retrieval-oriented hypergraph directly from the corpus, without asking an LLM to generate explicit relations.
+- It uses entity recognition (spaCy or GLiNER) and semantic linking to construct hyperedges at near-zero token cost during indexing.
+- At query time, it performs hop-wise frontier expansion with conductance gating and progressive query steering, activating multiple related evidence chains in one retrieval pass.
+- This enables single-step multi-hop retrieval: instead of retrieving hop by hop, Hyperflow can connect scattered evidence across entities, semantic units, and passages in one shot.
 
 ## Core Idea
 
 Hyperflow has two stages: offline indexing and online retrieval.
 
-### 1. Offline indexing: build an indexing hypergraph with near-zero token cost
+### 1. Offline Indexing: Build a Hypergraph with Near-Zero Token Cost
 
 Given a corpus of passages, Hyperflow:
 
-1. Uses spaCy NER to extract entities from each passage.
-2. Splits passages into sentence-level contexts.
-3. Treats each sentence as a hyperedge that connects all entities appearing in that sentence.
-4. Stores embeddings for passages, entities, and sentences.
-5. Builds an auxiliary graph over passages and entities for final ranking.
+1. Chunks the corpus into ~1200-token passages with overlap.
+2. Splits each passage into semantic units via Kamradt Percentile merging (embedding-based sentence grouping).
+3. Runs NER on each semantic unit to extract entities (GLiNER zero-shot or spaCy).
+4. Normalizes and deduplicates entities via text canonicalization and embedding-based merging.
+5. Treats each semantic unit as a hyperedge connecting all entities that co-occur in it.
+6. Stores embeddings for passages, entities, and semantic units in Parquet files.
+7. Builds an auxiliary passage-entity graph for final ranking.
 
-The key point is that no LLM is required to explicitly generate relation triples or graph edges during indexing. Hyperedges come directly from entity-sentence co-occurrence, so the offline stage is fast and essentially token-free.
+No LLM is required during indexing. Hyperedges come directly from entity-semantic unit co-occurrence.
 
-### 2. Online retrieval: single-step multi-hop reasoning over the hypergraph
+### 2. Online Retrieval: Single-Step Multi-Hop Reasoning
 
 For each question, Hyperflow:
 
-1. Extracts seed entities from the query.
-2. Semantically links them to indexed entities using embedding similarity.
-3. Runs query-aware hypergraph spectral diffusion from these seed entities.
-4. Scores passages by combining dense retrieval signals with activated entity evidence.
-5. Applies personalized PageRank on the passage-entity graph.
-6. Uses a reranker to select the final evidence passages.
-7. Sends the retrieved evidence to a reader LLM to generate the answer.
-
-This lets the system retrieve evidence chains that span multiple passages without explicit hop-by-hop planning.
+1. Extracts seed entities from the query via NER.
+2. Matches them to the nearest indexed entities by embedding similarity.
+3. Runs frontier expansion on the hypergraph:
+   - Each hop discovers new entities through query-relevant semantic units, gated by conductance.
+   - Progressive query steering shifts the query embedding toward discovered entities between hops.
+4. Scores passages via dual-channel fusion:
+   - Channel 1 (semantic): cosine similarity between passage and query embeddings.
+   - Channel 2 (coverage): activation-weighted entity coverage with IDF.
+5. Optionally reranks candidates with `Qwen/Qwen3-Reranker-4B`.
+6. Sends the retrieved evidence to a reader LLM to generate the answer.
 
 ## Core Algorithms
 
-### Indexing hypergraph
+### Hypergraph Structure
 
-Hyperflow models the corpus as an entity-sentence hypergraph:
+Hyperflow models the corpus as an entity-semantic unit hypergraph:
 
-- Vertices: entities
-- Hyperedges: sentences
-- Passage nodes: used later for ranking and evidence aggregation
+- **Vertices**: entities (extracted via NER, normalized and deduplicated)
+- **Hyperedges**: semantic units (sentence groups produced by Kamradt Percentile chunking)
+- **Incidence matrix H**: `H[v, e] = 1` iff entity `v` appears in semantic unit `e`
 
-If an entity appears in a sentence, the corresponding entity node is connected to that sentence hyperedge. This gives a sparse incidence structure that preserves contextual grouping without requiring explicit relation extraction.
+### Frontier Expansion
 
-### Query-aware hypergraph spectral diffusion
+During retrieval, Hyperflow propagates relevance from seed entities through the hypergraph using explicit BFS-like hop-by-hop exploration:
 
-During retrieval, Hyperflow propagates relevance scores from seed entities over the hypergraph using a query-adaptive diffusion operator. The implementation follows the form:
+1. **Conductance gating**: each semantic unit receives a conductance weight based on its embedding similarity to the query. Units below a floor threshold are suppressed entirely.
+2. **Hop propagation**: at each hop, frontier entity scores flow through high-conductance semantic units to discover new entities. Candidates are scored via max-aggregation and top-K selection.
+3. **Hop decay**: scores decay exponentially with hop distance (`score × decay^hop`).
+4. **Progressive query steering**: after each hop, the query embedding is shifted toward the centroid of top activated entities, updating conductance for the next hop.
 
-`f^(t+1) = alpha * Theta_q * f^(t) + (1 - alpha) * f^(0)`
+### Dual-Channel Passage Scoring
 
-where `Theta_q` is built from:
+After frontier expansion, passages are scored by fusing two signals:
 
-- the entity-sentence incidence matrix `H`
-- vertex and hyperedge degree normalization
-- query-aware sentence weights `W_q`
+```
+final_score(p) = λ · semantic(p) + (1-λ) · coverage(p)
+```
 
-This allows the retrieval process to spread from query entities to semantically relevant sentence contexts and then back to other related entities.
+- `semantic(p)`: normalized cosine similarity between passage and query embeddings
+- `coverage(p)`: sum of (activation score × IDF) for each activated entity in the passage
+- `λ`: configurable fusion weight (default 0.5)
 
-### Flow damping for hub suppression
+### Reranking
 
-A common issue in graph retrieval is that hub nodes or frequently reused contexts can dominate propagation. Hyperflow addresses this with a flow-inspired damping mechanism:
-
-- hyperedges that accumulate too much propagated flow are progressively down-weighted
-- repeated activation of the same popular bridge becomes less influential over time
-- diffusion is encouraged to explore alternative but still query-relevant paths
-
-This makes retrieval more stable and helps reduce the interference caused by oversized hub structures.
-
-### Passage scoring and reranking
-
-After diffusion, Hyperflow combines:
-
-- dense passage retrieval scores
-- bonuses from activated entities found in each passage
-- personalized PageRank over the graph
-- local reranking with `Qwen/Qwen3-Reranker-4B`
-
-The result is a final list of evidence passages that are passed to the reader LLM.
-
-## Why Hyperflow
-
-Compared with a typical GraphRAG pipeline, Hyperflow emphasizes:
-
-- Lower offline cost: no LLM-based relation extraction during indexing
-- Better scalability: sparse hypergraph construction with embedding stores
-- More robust retrieval: flow damping weakens hub-node effects
-- Single-step multi-hop retrieval: multiple evidence chains can be activated in one pass
-- Simpler graph construction: NER plus semantic linking instead of explicit relation generation
+Optionally, top candidates are reranked using a Qwen3-based reranker that scores query-document relevance via yes/no logit comparison.
 
 ## Repository Structure
 
 ```text
 hyperflow/
-  config.py          # Global configuration
-  diffusion.py       # Hypergraph spectral diffusion and flow damping
-  embedding_store.py # Persistent embedding stores for passages/entities/sentences
-  engine.py          # Indexing, retrieval, QA pipeline
-  evaluate.py        # LLM-based and string-containment evaluation
-  graph.py           # Graph construction, PPR, passage scoring
-  ner.py             # spaCy-based entity extraction
-  reranker.py        # Qwen reranker
-  utils.py           # OpenAI-compatible LLM wrapper and utilities
-run.py               # Main entry point
-scripts/run.sh       # Example launch script
+  config.py               # HyperflowConfig dataclass
+  engine.py               # Main engine: indexing, retrieval, QA pipeline
+  frontier.py             # Frontier expansion algorithm
+  knowledge_graph.py      # Hypergraph structure, entity-passage graph
+  embedding_store.py      # Parquet-backed embedding store
+  ner.py                  # NER backends (spaCy + GLiNER zero-shot)
+  chunker.py              # Token chunking + Kamradt semantic unit splitting
+  entity_normalization.py # Text canonicalization + embedding-based entity merging
+  reranker.py             # Qwen3 reranker
+  utils.py                # LLM wrapper, hashing, logging utilities
+benchmarks/
+  graphrag_bench/          # GraphRAG-Bench benchmark runner
+  multihop/                # Multi-hop QA benchmark runner (HotpotQA, 2WikiMultiHop, MuSiQue)
 ```
 
 ## Installation
@@ -135,107 +116,77 @@ python -m spacy download en_core_web_trf
 
 ### 3. Set your LLM API credentials
 
-Hyperflow uses an OpenAI-compatible chat completion API for final answer generation and optional evaluation.
+Hyperflow uses an OpenAI-compatible chat completion API for final answer generation.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_BASE_URL="your-base-url"
 ```
 
-### 4. Prepare the embedding model
+### 4. Embedding model
 
-By default, the code expects a local sentence-transformer model at:
-
-```text
-model/all-mpnet-base-v2
-```
-
-### 5. Prepare the datasets
-
-Each dataset should contain:
-
-```text
-dataset/<dataset_name>/chunks.json
-dataset/<dataset_name>/questions.json
-```
-
-This repository currently includes example layouts for:
-
-- `2wikimultihop`
-- `hotpotqa`
-- `musique`
+By default, the code uses `BAAI/bge-large-en-v1.5` via sentence-transformers (downloaded automatically from Hugging Face Hub).
 
 ## Quick Start
 
+### GraphRAG-Bench
+
 ```bash
-python run.py \
-  --spacy_model en_core_web_trf \
-  --embedding_model model/all-mpnet-base-v2 \
-  --dataset_name 2wikimultihop \
-  --llm_model gpt-4o-mini \
-  --max_workers 16 \
-  --passage_ratio 0.05 \
-  --diffusion_alpha 0.85 \
-  --diffusion_max_iter 10 \
-  --flow_damping 0.5 \
-  --activation_ratio 0.05
+python benchmarks/graphrag_bench/run.py \
+  --corpus_name medical \
+  --ner_backend gliner \
+  --expansion_max_hops 3 \
+  --scoring_lambda 0.7
 ```
 
-For a fast smoke test, you can limit the number of questions:
+### Multi-hop QA
 
 ```bash
-python run.py \
-  --spacy_model en_core_web_trf \
-  --embedding_model model/all-mpnet-base-v2 \
-  --dataset_name 2wikimultihop \
-  --llm_model gpt-4o-mini \
+python benchmarks/multihop/run.py \
+  --dataset_name hotpotqa \
+  --ner_backend spacy \
+  --expansion_max_hops 3 \
+  --scoring_lambda 0.7
+```
+
+For a fast smoke test, limit the number of questions:
+
+```bash
+python benchmarks/graphrag_bench/run.py \
+  --corpus_name medical \
   --question_limit 20
 ```
 
-If you only want predictions and want to skip the evaluation stage:
+## Key Arguments
 
-```bash
-python run.py \
-  --spacy_model en_core_web_trf \
-  --embedding_model model/all-mpnet-base-v2 \
-  --dataset_name 2wikimultihop \
-  --llm_model gpt-4o-mini \
-  --skip_evaluation
-```
+| Argument | Description | Default |
+| --- | --- | --- |
+| `--ner_backend` | NER engine: `gliner` (zero-shot) or `spacy` | `gliner` |
+| `--expansion_max_hops` | Max BFS hops from seed entities | `3` |
+| `--expansion_top_k` | New entities discovered per hop | `15` |
+| `--hop_decay` | Score decay per hop | `0.5` |
+| `--conductance_floor` | Query-SU similarity below this is suppressed | `0.3` |
+| `--conductance_gamma` | Conductance power exponent | `1.0` |
+| `--scoring_lambda` | Fusion weight (1.0 = pure dense, 0.0 = pure entity coverage) | `0.7` |
+| `--semantic_unit_percentile` | Kamradt percentile for SU boundary detection | `80` |
+| `--no_rerank` | Disable reranking | `false` |
+| `--reranker_model` | Reranker model path | `Qwen/Qwen3-Reranker-4B` |
+| `--reranker_candidate_top_k` | Candidates passed to reranker | `30` |
+| `--question_limit` | Limit number of questions (for debugging) | all |
+| `--skip_qa` / `--skip_eval` | Skip QA generation or evaluation | `false` |
 
-## Important Arguments
+## Index Store
 
-| Argument | Description |
+Stored under `index_store/<dataset_name>/`:
+
+| File | Content |
 | --- | --- |
-| `--dataset_name` | Dataset folder under `dataset/` |
-| `--spacy_model` | spaCy model used for NER |
-| `--embedding_model` | Local sentence-transformer path |
-| `--llm_model` | Reader/evaluator LLM name |
-| `--passage_ratio` | Weight of dense passage retrieval in final passage scoring |
-| `--diffusion_alpha` | Diffusion strength; larger values favor broader propagation |
-| `--diffusion_max_iter` | Maximum number of diffusion iterations |
-| `--convergence_tol` | Early-stop threshold for diffusion convergence |
-| `--flow_damping` | Hyperedge flow damping factor; smaller values more strongly suppress repeatedly used paths |
-| `--activation_ratio` | Adaptive threshold for activating diffused entities |
-| `--use_context_modulation` | Use context-aware incidence weighting instead of binary incidence |
-| `--reranker_model` | Local or Hub path for the reranker |
-| `--reranker_candidate_top_k` | Number of retrieved candidates passed to the reranker |
-| `--question_limit` | Limit the number of questions for debugging |
-| `--skip_evaluation` | Skip answer evaluation |
+| `passage_embedding.parquet` | Passage text + embeddings |
+| `entity_embedding.parquet` | Entity text + embeddings |
+| `su_embedding.parquet` | Semantic unit text + embeddings |
+| `ner_results.json` | Cached NER results (passage → entities, SU hash → entities) |
 
-## Outputs
-
-### Offline indexing artifacts
-
-Stored under `import/<dataset_name>/`:
-
-- `passage_embedding.parquet`
-- `entity_embedding.parquet`
-- `sentence_embedding.parquet`
-- `ner_results.json`
-- `Hyperflow.graphml`
-
-### Run outputs
+### Run Outputs
 
 Stored under `results/<dataset_name>/<timestamp>/`:
 
@@ -243,26 +194,11 @@ Stored under `results/<dataset_name>/<timestamp>/`:
 - `evaluation_results.json`
 - `log.txt`
 
-## Current Pipeline in Code
-
-The current implementation in this repository follows this pipeline:
-
-1. Insert passage embeddings into a persistent store.
-2. Run spaCy NER and cache entity extraction results.
-3. Build entity-sentence incidence mappings.
-4. Build sparse hypergraph structures and graph edges.
-5. Extract query seed entities and semantically link them to indexed entities.
-6. Perform hypergraph spectral diffusion with flow damping.
-7. Score passages and run personalized PageRank.
-8. Rerank final evidence passages.
-9. Ask the reader LLM to answer from retrieved evidence.
-10. Optionally evaluate predictions with an LLM judge and containment metric.
-
 ## Notes
 
-- Hyperflow avoids LLM usage in the indexing stage, but it still uses an LLM for final answer generation and optional evaluation.
-- The reranker is loaded locally through Hugging Face Transformers and may require substantial GPU memory depending on the chosen model.
-- The default code path uses CUDA when available for embedding inference, diffusion, and reranking.
+- Hyperflow avoids LLM usage in the indexing stage, but still uses an LLM for final answer generation.
+- The reranker is loaded locally through Hugging Face Transformers and may require substantial GPU memory.
+- The default code path uses CUDA when available for embedding inference, hypergraph operations, and reranking.
 
 ## License
 

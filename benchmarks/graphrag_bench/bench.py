@@ -41,22 +41,30 @@ QUESTION_FILES = {
 }
 
 
-def load_corpus(corpus_name: str) -> str:
-    """Load raw corpus text from local GraphRAG-Bench cache.
+def load_corpus(corpus_name: str) -> list[dict]:
+    """Load corpus entries from local GraphRAG-Bench cache.
+
+    Each entry has keys: corpus_name, context.
+    - medical.json: single dict -> wrapped as one-element list
+    - novel.json: list of 20 dicts, one per novel
 
     Args:
         corpus_name: "medical" or "novel"
 
     Returns:
-        Raw corpus text string
+        List of dicts with "corpus_name" and "context" keys
     """
     snapshot = _get_snapshot_dir()
     path = snapshot / CORPUS_FILES[corpus_name]
     with open(path, "r") as f:
         data = json.load(f)
-    corpus_text = data[0]["context"]
-    logger.info("Loaded %s corpus: %d chars", corpus_name, len(corpus_text))
-    return corpus_text
+    # medical.json is a single dict, novel.json is a list
+    if isinstance(data, dict):
+        data = [data]
+    logger.info("Loaded %s corpus: %d entries", corpus_name, len(data))
+    for entry in data:
+        logger.info("  %s: %d chars", entry["corpus_name"], len(entry["context"]))
+    return data
 
 
 def load_questions(corpus_name: str) -> list[dict]:
@@ -95,7 +103,7 @@ def format_results(retrieval_results: list[dict], questions: list[dict]) -> list
         python -m Evaluation.retrieval_eval --data_file <output>
 
     Required fields: id, question, source, context (List[str]),
-    evidence (List[str]), question_type, generated_answer, ground_truth
+    evidence (str), question_type, generated_answer, ground_truth
 
     Args:
         retrieval_results: Output from Hyperflow qa() -- list of dicts with
@@ -111,8 +119,8 @@ def format_results(retrieval_results: list[dict], questions: list[dict]) -> list
             "id": question["id"],
             "question": result["question"],
             "source": question["source"],
-            "context": result.get("sorted_passage", []),  # List[str], not joined
-            "evidence": question.get("evidence", []),
+            "context": result.get("sorted_passage", []),  # List[str]
+            "evidence": question.get("evidence", ""),
             "question_type": question.get("question_type", ""),
             "generated_answer": result.get("pred_answer", ""),
             "ground_truth": question["answer"],

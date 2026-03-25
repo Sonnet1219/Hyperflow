@@ -85,11 +85,6 @@ def normalize_entity_list(normalizer: EntityNormalizer,
     return normalized
 
 
-def normalize_entity_text(normalizer: EntityNormalizer, text: str) -> str:
-    """Normalize a single already-lowered entity string."""
-    return normalizer.canonicalize(text)
-
-
 def merge_similar_entities(entity_texts, embedding_model,
                            passage_entities: dict, su_entities: dict,
                            threshold: float = 0.93, batch_size: int = 128):
