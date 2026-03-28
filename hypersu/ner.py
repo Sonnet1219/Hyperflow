@@ -156,6 +156,35 @@ class LangExtractExtractor:
             temperature=0.0,
         )
 
+    def _extract_mentions_from_su_batch_once(
+        self, su_items, passage_hash_id: str
+    ) -> dict[str, list[dict]]:
+        """Run one batch extraction attempt for a set of semantic units."""
+        documents = [
+            lx.data.Document(text=su_text, document_id=su_hash_id)
+            for su_hash_id, su_text in su_items
+        ]
+        document_results = self._extract_documents(documents)
+        mentions_by_su = {su_hash_id: [] for su_hash_id, _ in su_items}
+
+        for annotated_document in document_results:
+            su_hash_id = annotated_document.document_id
+            seen = set()
+            for extraction in annotated_document.extractions or []:
+                mention = self._build_mention_record(extraction, passage_hash_id, su_hash_id)
+                if mention is None:
+                    continue
+                dedupe_key = (
+                    mention["normalized_name"],
+                    mention["entity_type"],
+                    mention["description"],
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                mentions_by_su.setdefault(su_hash_id, []).append(mention)
+        return mentions_by_su
+
     def _build_mention_record(self, extraction, passage_hash_id: str, su_hash_id: str):
         surface_text = (extraction.extraction_text or "").strip()
         normalized_name = normalize_entity_name(surface_text)
@@ -193,35 +222,50 @@ class LangExtractExtractor:
         """Extract mentions for a batch of semantic units from one passage."""
         if not su_items:
             return {}
-
-        documents = [
-            lx.data.Document(text=su_text, document_id=su_hash_id)
-            for su_hash_id, su_text in su_items
-        ]
-        document_results = self._extract_documents(documents)
-        mentions_by_su = {su_hash_id: [] for su_hash_id, _ in su_items}
-
-        for annotated_document in document_results:
-            su_hash_id = annotated_document.document_id
-            seen = set()
-            for extraction in annotated_document.extractions or []:
-                mention = self._build_mention_record(extraction, passage_hash_id, su_hash_id)
-                if mention is None:
-                    continue
-                dedupe_key = (
-                    mention["normalized_name"],
-                    mention["entity_type"],
-                    mention["description"],
+        try:
+            return self._extract_mentions_from_su_batch_once(su_items, passage_hash_id)
+        except ValueError as exc:
+            if len(su_items) == 1:
+                su_hash_id, _ = su_items[0]
+                logger.warning(
+                    "LangExtract failed for semantic unit %s in passage %s; "
+                    "returning empty mentions. error=%s",
+                    su_hash_id,
+                    passage_hash_id,
+                    exc,
                 )
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                mentions_by_su.setdefault(su_hash_id, []).append(mention)
-        return mentions_by_su
+                return {su_hash_id: []}
+
+            midpoint = max(1, len(su_items) // 2)
+            logger.warning(
+                "LangExtract batch extraction failed for %s semantic units in passage %s; "
+                "retrying with smaller batches. error=%s",
+                len(su_items),
+                passage_hash_id,
+                exc,
+            )
+            left_mentions = self.extract_mentions_from_su_batch(
+                su_items[:midpoint], passage_hash_id
+            )
+            right_mentions = self.extract_mentions_from_su_batch(
+                su_items[midpoint:], passage_hash_id
+            )
+            merged_mentions = {su_hash_id: [] for su_hash_id, _ in su_items}
+            merged_mentions.update(left_mentions)
+            merged_mentions.update(right_mentions)
+            return merged_mentions
 
     def extract_query_entities(self, query: str) -> list[dict]:
         """Extract query entities using the same schema as index-time mentions."""
-        result = self._extract_documents(query)
+        try:
+            result = self._extract_documents(query)
+        except ValueError as exc:
+            logger.warning(
+                "LangExtract query extraction failed; continuing without query entities. "
+                "error=%s",
+                exc,
+            )
+            return []
         query_mentions = []
         seen = set()
         for extraction in result.extractions or []:
