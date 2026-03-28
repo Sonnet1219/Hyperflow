@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-from hyperflow.ner import get_gliner_labels_for_corpus
 from hyperflow.engine import Hyperflow
 from hyperflow.chunker import chunk_corpus_by_tokens
 from hyperflow.utils import setup_logging
@@ -45,17 +44,18 @@ def parse_arguments():
     # --- Corpus ---
     parser.add_argument("--corpus_name", type=str, default="medical",
                         choices=["medical", "novel"], help="Which corpus to use")
+    parser.add_argument("--corpus_entry", type=str, default=None,
+                        help="Optional single corpus entry to process, e.g. Novel-30752")
 
     # --- Models ---
     parser.add_argument("--embedding_model", type=str, default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--llm_model", type=str, default=os.getenv("LLM_MODEL_NAME", "gpt-4o-mini"))
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf")
 
-    # --- NER ---
-    parser.add_argument("--ner_backend", type=str, default="gliner",
-                        choices=["gliner", "spacy"], help="NER backend")
-    parser.add_argument("--gliner_model", type=str, default="urchade/gliner_large-v2.1")
-    parser.add_argument("--gliner_threshold", type=float, default=0.3)
+    # --- Entity extraction ---
+    parser.add_argument("--langextract_model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--langextract_max_char_buffer", type=int, default=1000)
+    parser.add_argument("--langextract_extraction_passes", type=int, default=1)
 
     # --- Chunking ---
     parser.add_argument("--chunk_size", type=int, default=1200, help="Token size for corpus chunking")
@@ -204,6 +204,15 @@ def main():
     corpus_entries = load_corpus(args.corpus_name)
     all_questions = load_questions(args.corpus_name)
 
+    if args.corpus_entry is not None:
+        corpus_entries = [entry for entry in corpus_entries if entry["corpus_name"] == args.corpus_entry]
+        all_questions = [q for q in all_questions if q.get("source") == args.corpus_entry]
+        if not corpus_entries:
+            raise ValueError(
+                f"Corpus entry '{args.corpus_entry}' not found in {args.corpus_name} corpus."
+            )
+        print(f"Restricted to corpus entry: {args.corpus_entry}")
+
     # Filter question types
     if args.question_types is not None:
         allowed = set(args.question_types)
@@ -224,13 +233,14 @@ def main():
     corpus_by_name = {entry["corpus_name"]: entry["context"] for entry in corpus_entries}
 
     # Find which corpus entries have matching questions
-    sources_needed = set(questions_by_source.keys())
+    if args.skip_qa and args.corpus_entry is not None:
+        sources_needed = {args.corpus_entry}
+    else:
+        sources_needed = set(questions_by_source.keys())
     sources_available = set(corpus_by_name.keys())
     missing = sources_needed - sources_available
     if missing:
         print(f"WARNING: Questions reference unknown sources: {missing}")
-
-    gliner_labels = get_gliner_labels_for_corpus(args.corpus_name)
 
     all_formatted = []
 
@@ -262,16 +272,15 @@ def main():
             reranker_candidate_top_k=args.reranker_candidate_top_k,
             reranker_batch_size=args.reranker_batch_size,
             reranker_max_length=args.reranker_max_length,
-            ner_backend=args.ner_backend,
-            gliner_model=args.gliner_model,
-            gliner_threshold=args.gliner_threshold,
-            gliner_labels=gliner_labels,
+            langextract_model_id=args.langextract_model,
+            langextract_max_char_buffer=args.langextract_max_char_buffer,
+            langextract_extraction_passes=args.langextract_extraction_passes,
         )
 
         # Chunk corpus with semantic boundary awareness
         chunks = chunk_corpus_by_tokens(
             corpus_text, args.chunk_size, args.chunk_overlap,
-            nlp_model=model.spacy_ner.spacy_model,
+            nlp_model=model.spacy_model,
             embedding_model=model.embedding_model,
         )
         passages = list(chunks)

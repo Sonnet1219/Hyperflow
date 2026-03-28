@@ -1,23 +1,28 @@
 """Hyperflow: Hypergraph-based retrieval-augmented generation engine."""
 
-from hyperflow.config import HyperflowConfig
-from hyperflow.embedding_store import EmbeddingStore
-from hyperflow.entity_normalization import merge_similar_entities
-from hyperflow.ner import SpacyNER, GLiNERExtractor
-from hyperflow.reranker import QwenReranker
-from hyperflow.chunker import create_semantic_units
-from hyperflow.frontier import frontier_expansion
-from hyperflow.knowledge_graph import KnowledgeGraph, dense_retrieval
-from hyperflow.utils import LLM_Model, compute_mdhash_id
+from __future__ import annotations
 
-import os
 import json
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import spacy
 import torch
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+
+from hyperflow.chunker import create_semantic_units
+from hyperflow.config import HyperflowConfig
+from hyperflow.embedding_store import EmbeddingStore
+from hyperflow.entity_normalization import merge_entity_mentions
+from hyperflow.frontier import frontier_expansion
+from hyperflow.knowledge_graph import KnowledgeGraph, dense_retrieval
+from hyperflow.ner import LangExtractExtractor
+from hyperflow.reranker import QwenReranker
+from hyperflow.utils import LLM_Model, compute_mdhash_id
+
 
 logger = logging.getLogger(__name__)
 
@@ -34,40 +39,33 @@ class Hyperflow:
         logger.info("Initializing Hyperflow with config: %s", self.config)
         logger.info("Retrieval method: Frontier Expansion")
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Using device: %s", self.device)
 
-        # Load embedding model (needed for indexing and retrieval)
         self.embedding_model = SentenceTransformer(
             embedding_model_name, device=str(self.device)
         )
-        # LLM is lazy-loaded on first use (only needed for rag_qa, not indexing/retrieval)
         self._llm_model = None
 
-        # Initialize stores
         self._init_embedding_stores()
 
-        # Load NER
-        self.spacy_ner = SpacyNER(self.config.spacy_model)
-        if self.config.ner_backend == "gliner":
-            self.ner_extractor = GLiNERExtractor(
-                model_name=self.config.gliner_model,
-                labels=self.config.gliner_labels,
-                threshold=self.config.gliner_threshold,
-                min_entity_length=self.config.min_entity_length,
-                enable_long_text_windowing=self.config.enable_gliner_long_text_windowing,
-                window_overlap_sentences=self.config.gliner_window_overlap_sentences,
-                normalizer=self.spacy_ner.normalizer,
-                device=str(self.device),
-            )
-            logger.info("NER backend: GLiNER")
-        else:
-            self.ner_extractor = self.spacy_ner
-            logger.info("NER backend: spaCy")
+        spacy.prefer_gpu()
+        self.spacy_model = spacy.load(self.config.spacy_model)
+        logger.info("spaCy sentence splitter loaded with model: %s", self.config.spacy_model)
 
-        # Graph and reranker
+        self.ner_extractor = LangExtractExtractor(
+            model_id=self.config.langextract_model_id,
+            api_key=self.config.langextract_api_key,
+            model_url=self.config.langextract_model_url,
+            max_char_buffer=self.config.langextract_max_char_buffer,
+            extraction_passes=self.config.langextract_extraction_passes,
+            max_workers=self.config.max_workers,
+            use_schema_constraints=self.config.langextract_use_schema_constraints,
+        )
+
         self.knowledge_graph = KnowledgeGraph()
         self.reranker = None
+        self.entity_nodes_by_hash = {}
 
     @property
     def llm_model(self):
@@ -80,159 +78,205 @@ class Hyperflow:
         self.passage_embedding_store = EmbeddingStore(
             self.embedding_model,
             db_filename=os.path.join(save_dir, "passage_embedding.parquet"),
-            batch_size=self.config.batch_size, namespace="passage"
+            batch_size=self.config.batch_size,
+            namespace="passage",
         )
         self.entity_embedding_store = EmbeddingStore(
             self.embedding_model,
             db_filename=os.path.join(save_dir, "entity_embedding.parquet"),
-            batch_size=self.config.batch_size, namespace="entity"
+            batch_size=self.config.batch_size,
+            namespace="entity",
         )
         self.su_embedding_store = EmbeddingStore(
             self.embedding_model,
             db_filename=os.path.join(save_dir, "su_embedding.parquet"),
-            batch_size=self.config.batch_size, namespace="su"
+            batch_size=self.config.batch_size,
+            namespace="su",
         )
 
     # ====== Indexing ======
 
     def index(self, docs):
-        """Build the hypergraph index from documents.
-
-        Args:
-            docs: list of passage strings (e.g. ["0:chunk_text", "1:chunk_text", ...])
-        """
+        """Build the hypergraph index from documents."""
         self.passage_embedding_store.insert_text(docs)
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
 
-        cached_passage_entities, cached_su_entities, uncached_passage_ids = \
-            self._load_cached_ner(hash_id_to_passage.keys())
+        cached_passage_to_su_ids, cached_su_data, uncached_passage_ids = \
+            self._load_cached_extractions(hash_id_to_passage.keys())
         logger.info(
-            "NER cache status: cached_passages=%s, uncached_passages=%s",
-            len(cached_passage_entities), len(uncached_passage_ids),
+            "Extraction cache status: cached_passages=%s, uncached_passages=%s",
+            len(cached_passage_to_su_ids),
+            len(uncached_passage_ids),
         )
 
-        if len(uncached_passage_ids) > 0:
-            new_hash_id_to_passage = {k: hash_id_to_passage[k] for k in uncached_passage_ids}
-
-            # Step 1: Create semantic units via Kamradt Percentile
-            logger.info("Creating semantic units via Kamradt Percentile (p=%s)...",
-                        self.config.semantic_unit_percentile)
-            all_su_texts = []
-            passage_to_su_texts = {}
-            for p_hash_id, p_text in tqdm(new_hash_id_to_passage.items(), desc="Semantic Unit Chunking"):
-                su_texts = create_semantic_units(
-                    p_text, self.spacy_ner.spacy_model,
-                    self.embedding_model,
-                    self.config.semantic_unit_percentile
-                )
-                passage_to_su_texts[p_hash_id] = su_texts
-                all_su_texts.extend(su_texts)
-            logger.info("Created %s semantic units from %s passages (avg %.1f SU/passage)",
-                        len(all_su_texts), len(new_hash_id_to_passage),
-                        len(all_su_texts) / max(len(new_hash_id_to_passage), 1))
-
-            # Step 2: Run NER on each semantic unit
-            new_passage_entities = {}
-            new_su_entities = {}
-            for p_hash_id, su_texts in tqdm(passage_to_su_texts.items(), desc="Entity Extraction"):
-                passage_entities = set()
-                for su_text in su_texts:
-                    su_ents = self.ner_extractor.extract_entities_from_text(su_text)
-                    if su_ents:
-                        new_su_entities[su_text] = su_ents
-                        passage_entities.update(su_ents)
-                new_passage_entities[p_hash_id] = list(passage_entities)
-
-            # Merge new with cached
-            cached_passage_entities.update(new_passage_entities)
-            cached_su_entities.update(new_su_entities)
-        else:
-            logger.info("All passages already have cached NER results; skipping NER recomputation.")
-
-        self._persist_ner_data(cached_passage_entities, cached_su_entities)
-
-        # Build graph structures
-        entity_nodes, su_nodes, passage_to_entities, entity_to_su, _ = \
-            self.knowledge_graph.build_node_edge_maps(cached_passage_entities, cached_su_entities)
-
-        self.su_embedding_store.insert_text(list(su_nodes))
-
-        # Merge semantically similar entities before inserting into store
-        entity_nodes, cached_passage_entities, cached_su_entities, alias_map = \
-            merge_similar_entities(
-                list(entity_nodes), self.embedding_model,
-                cached_passage_entities, cached_su_entities,
-                threshold=0.93, batch_size=self.config.batch_size,
+        if uncached_passage_ids:
+            new_hash_id_to_passage = {
+                hash_id: hash_id_to_passage[hash_id]
+                for hash_id in uncached_passage_ids
+            }
+            logger.info(
+                "Creating semantic units via Kamradt Percentile (p=%s)...",
+                self.config.semantic_unit_percentile,
             )
-        if alias_map:
-            self._persist_ner_data(cached_passage_entities, cached_su_entities)
-            _, su_nodes, passage_to_entities, entity_to_su, _ = \
-                self.knowledge_graph.build_node_edge_maps(cached_passage_entities, cached_su_entities)
 
-        self.entity_embedding_store.insert_text(list(entity_nodes))
+            total_su_count = 0
+            for passage_hash_id, passage_text in tqdm(
+                new_hash_id_to_passage.items(),
+                desc="Semantic Unit Chunking",
+            ):
+                su_texts = create_semantic_units(
+                    passage_text,
+                    self.spacy_model,
+                    self.embedding_model,
+                    self.config.semantic_unit_percentile,
+                )
+                su_items = []
+                su_hash_ids = []
+                for su_text in su_texts:
+                    su_hash_id = compute_mdhash_id(su_text, prefix="su-")
+                    su_items.append((su_hash_id, su_text))
+                    su_hash_ids.append(su_hash_id)
+                cached_passage_to_su_ids[passage_hash_id] = su_hash_ids
+                total_su_count += len(su_items)
+
+                su_mentions = self.ner_extractor.extract_mentions_from_su_batch(
+                    su_items, passage_hash_id=passage_hash_id
+                )
+                for su_hash_id, su_text in su_items:
+                    cached_su_data[su_hash_id] = {
+                        "text": su_text,
+                        "mentions": su_mentions.get(su_hash_id, []),
+                    }
+
+            logger.info(
+                "Created %s semantic units from %s passages (avg %.1f SU/passage)",
+                total_su_count,
+                len(new_hash_id_to_passage),
+                total_su_count / max(len(new_hash_id_to_passage), 1),
+            )
+        else:
+            logger.info("All passages already have cached extraction results; skipping extraction.")
+
+        self._persist_extraction_data(cached_passage_to_su_ids, cached_su_data)
+
+        # Rebuild SU/entity stores from the extraction cache so the graph stays consistent.
+        self.su_embedding_store.clear()
+        self.entity_embedding_store.clear()
+        self.knowledge_graph = KnowledgeGraph()
+
+        su_text_by_hash = {
+            su_hash_id: payload["text"]
+            for su_hash_id, payload in cached_su_data.items()
+            if payload.get("text")
+        }
+        self.su_embedding_store.insert_text(list(su_text_by_hash.values()))
+
+        all_mentions = []
+        for payload in cached_su_data.values():
+            all_mentions.extend(payload.get("mentions", []))
+
+        entity_nodes, passage_entities, su_entities, passage_entity_counts = \
+            merge_entity_mentions(
+                all_mentions,
+                su_text_by_hash,
+                self.embedding_model,
+                similarity_threshold=self.config.entity_merge_threshold,
+                batch_size=self.config.batch_size,
+            )
+
+        entity_texts = [node["embedding_text"] for node in entity_nodes]
+        self.entity_embedding_store.insert_text(entity_texts)
+        self._persist_entity_nodes(entity_nodes)
+
+        _, _, passage_to_entities, entity_to_su, _ = \
+            self.knowledge_graph.build_node_edge_maps(passage_entities, su_entities)
 
         self.knowledge_graph.build_entity_su_mapping(
-            entity_to_su, self.entity_embedding_store, self.su_embedding_store
+            entity_to_su,
+            self.entity_embedding_store,
+            self.su_embedding_store,
         )
         self.knowledge_graph.link_entities_to_passages(
-            passage_to_entities, self.passage_embedding_store, self.entity_embedding_store
+            passage_to_entities,
+            self.passage_embedding_store,
+            self.entity_embedding_store,
+            passage_entity_counts=passage_entity_counts,
         )
         self.knowledge_graph.link_adjacent_passages(self.passage_embedding_store)
 
-    def _load_cached_ner(self, passage_hash_ids):
+    def _load_cached_extractions(self, passage_hash_ids):
         self._ner_cache_path = os.path.join(self.config.save_dir, "ner_results.json")
-        if os.path.exists(self._ner_cache_path):
-            with open(self._ner_cache_path) as f:
-                cached = json.load(f)
-            cached_passage_entities = cached["passage_hash_id_to_entities"]
-            raw_su = cached.get("su_to_entities",
-                                cached.get("sentence_to_entities", {}))
-            # Convert hash_id keys back to text keys using su_embedding_store
-            hid_to_text = self.su_embedding_store.hash_id_to_text
-            cached_su_entities = {}
-            for key, entities in raw_su.items():
-                if key in hid_to_text:
-                    # Key is a hash_id — resolve to text
-                    cached_su_entities[hid_to_text[key]] = entities
-                else:
-                    # Legacy format: key is already text
-                    cached_su_entities[key] = entities
-            uncached_ids = set(passage_hash_ids) - set(cached_passage_entities.keys())
-            return cached_passage_entities, cached_su_entities, uncached_ids
-        return {}, {}, set(passage_hash_ids)
+        if not os.path.exists(self._ner_cache_path):
+            return {}, {}, set(passage_hash_ids)
 
-    def _persist_ner_data(self, passage_entities, su_entities):
-        # Store su_to_entities with hash_id keys instead of full text
-        su_by_hash = {}
-        for su_text, entities in su_entities.items():
-            su_hash_id = compute_mdhash_id(su_text, prefix="su-")
-            su_by_hash[su_hash_id] = entities
+        with open(self._ner_cache_path, encoding="utf-8") as handle:
+            cached = json.load(handle)
+
+        if cached.get("schema_version") != 2:
+            logger.warning(
+                "Ignoring legacy extraction cache at %s because schema_version != 2",
+                self._ner_cache_path,
+            )
+            return {}, {}, set(passage_hash_ids)
+
+        passage_to_su_ids = cached.get("passage_hash_id_to_su_hash_ids", {})
+        su_to_data = cached.get("su_to_data", {})
+        uncached_ids = set(passage_hash_ids) - set(passage_to_su_ids.keys())
+        return passage_to_su_ids, su_to_data, uncached_ids
+
+    def _persist_extraction_data(self, passage_to_su_ids, su_to_data):
         os.makedirs(os.path.dirname(self._ner_cache_path), exist_ok=True)
-        with open(self._ner_cache_path, "w") as f:
-            json.dump({
-                "passage_hash_id_to_entities": passage_entities,
-                "su_to_entities": su_by_hash,
-            }, f)
+        with open(self._ner_cache_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 2,
+                    "passage_hash_id_to_su_hash_ids": passage_to_su_ids,
+                    "su_to_data": su_to_data,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+    def _persist_entity_nodes(self, entity_nodes):
+        entity_nodes_path = os.path.join(self.config.save_dir, "entity_nodes.json")
+        self.entity_nodes_by_hash = {}
+        serializable_nodes = {}
+        for entity_node in entity_nodes:
+            entity_text = entity_node["embedding_text"]
+            entity_hash_id = self.entity_embedding_store.text_to_hash_id.get(entity_text)
+            if entity_hash_id is None:
+                continue
+            stored_node = dict(entity_node)
+            stored_node["hash_id"] = entity_hash_id
+            self.entity_nodes_by_hash[entity_hash_id] = stored_node
+            serializable_nodes[entity_hash_id] = stored_node
+
+        with open(entity_nodes_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "entities": serializable_nodes,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
 
     # ====== Retrieval ======
 
     def retrieve(self, queries, num_to_retrieve=None):
-        """Retrieve relevant passages for a list of queries.
-
-        Args:
-            queries: list of query strings
-            num_to_retrieve: number of passages to return per query (default: config.retrieval_top_k)
-
-        Returns:
-            list of dicts: [{"query": str, "passages": list[str], "scores": list[float]}, ...]
-        """
+        """Retrieve relevant passages for a list of queries."""
         top_k = num_to_retrieve or self.config.retrieval_top_k
         use_rerank = self.config.use_reranker
 
         if use_rerank:
             self._lazy_load_reranker()
-            logger.info("Reranking enabled: top %s candidates -> top %s final passages",
-                        self.config.reranker_candidate_top_k, top_k)
+            logger.info(
+                "Reranking enabled: top %s candidates -> top %s final passages",
+                self.config.reranker_candidate_top_k,
+                top_k,
+            )
         else:
             logger.info("Reranking disabled. Using dual-channel scoring (top %s).", top_k)
 
@@ -241,49 +285,72 @@ class Hyperflow:
         retrieval_results = []
         for query in tqdm(queries, desc="Retrieving"):
             query_embedding = self.embedding_model.encode(
-                query, normalize_embeddings=True, show_progress_bar=False,
+                query,
+                normalize_embeddings=True,
+                show_progress_bar=False,
                 batch_size=self.config.batch_size,
-                prompt=self.config.query_instruction_prefix
+                prompt=self.config.query_instruction_prefix,
             )
             _, seed_indices, seed_texts, seed_hash_ids, seed_scores = \
                 self.extract_seed_entities(query)
 
-            if len(seed_texts) != 0:
+            if seed_texts:
                 sorted_hash_ids, sorted_scores = self._diffuse_from_seeds(
-                    query, query_embedding, seed_indices, seed_hash_ids, seed_scores
+                    query,
+                    query_embedding,
+                    seed_indices,
+                    seed_hash_ids,
+                    seed_scores,
                 )
                 if use_rerank:
                     candidate_hash_ids = sorted_hash_ids[:self.config.reranker_candidate_top_k]
                     candidate_passages = [
-                        self.passage_embedding_store.hash_id_to_text[h]
-                        for h in candidate_hash_ids
+                        self.passage_embedding_store.hash_id_to_text[hash_id]
+                        for hash_id in candidate_hash_ids
                     ]
                     _, final_scores, final_passages = self._rerank_passages(
-                        query, candidate_hash_ids, candidate_passages, top_k
+                        query,
+                        candidate_hash_ids,
+                        candidate_passages,
+                        top_k,
                     )
                 else:
                     top_hash_ids = sorted_hash_ids[:top_k]
-                    final_scores = [float(s) for s in sorted_scores[:top_k]]
+                    final_scores = [float(score) for score in sorted_scores[:top_k]]
                     final_passages = [
-                        self.passage_embedding_store.hash_id_to_text[h]
-                        for h in top_hash_ids
+                        self.passage_embedding_store.hash_id_to_text[hash_id]
+                        for hash_id in top_hash_ids
                     ]
             else:
-                # Fallback: dense retrieval when no entities found
                 sorted_indices, sorted_scores = dense_retrieval(
-                    self._passage_embeddings, query_embedding
+                    self._passage_embeddings,
+                    query_embedding,
                 )
                 if use_rerank:
                     candidate_indices = sorted_indices[:self.config.reranker_candidate_top_k]
-                    candidate_hash_ids = [self.passage_embedding_store.hash_ids[idx] for idx in candidate_indices]
-                    candidate_passages = [self.passage_embedding_store.texts[idx] for idx in candidate_indices]
+                    candidate_hash_ids = [
+                        self.passage_embedding_store.hash_ids[idx]
+                        for idx in candidate_indices
+                    ]
+                    candidate_passages = [
+                        self.passage_embedding_store.texts[idx]
+                        for idx in candidate_indices
+                    ]
                     _, final_scores, final_passages = self._rerank_passages(
-                        query, candidate_hash_ids, candidate_passages, top_k
+                        query,
+                        candidate_hash_ids,
+                        candidate_passages,
+                        top_k,
                     )
                 else:
                     top_indices = sorted_indices[:top_k]
-                    final_scores = [float(sorted_scores[i]) for i in range(len(top_indices))]
-                    final_passages = [self.passage_embedding_store.texts[idx] for idx in top_indices]
+                    final_scores = [
+                        float(sorted_scores[idx]) for idx in range(len(top_indices))
+                    ]
+                    final_passages = [
+                        self.passage_embedding_store.texts[idx]
+                        for idx in top_indices
+                    ]
 
             retrieval_results.append({
                 "query": query,
@@ -295,70 +362,75 @@ class Hyperflow:
     def _prepare_retrieval_cache(self):
         """Cache embeddings and graph lookups. Called once before retrieval loop."""
         self._entity_hash_ids = list(self.entity_embedding_store.hash_id_to_text.keys())
-        self._entity_embeddings = np.array(self.entity_embedding_store.embeddings)
+        self._entity_embeddings = np.asarray(self.entity_embedding_store.embeddings)
         self._passage_hash_ids = list(self.passage_embedding_store.hash_id_to_text.keys())
-        self._passage_embeddings = np.array(self.passage_embedding_store.embeddings)
-        self._su_embeddings = np.array(self.su_embedding_store.embeddings)
+        self._passage_embeddings = np.asarray(self.passage_embedding_store.embeddings)
+        self._su_embeddings = np.asarray(self.su_embedding_store.embeddings)
 
-        # Build hypergraph
         logger.info("Building hypergraph...")
         self.knowledge_graph.build_hypergraph(
-            self.entity_embedding_store, self.su_embedding_store, self.device,
+            self.entity_embedding_store,
+            self.su_embedding_store,
+            self.device,
         )
 
-        # Precompute entity IDF for dual-channel scoring
+        entity_hash_id_set = set(self._entity_hash_ids)
         kg = self.knowledge_graph
         num_passages = len(self._passage_hash_ids)
         self._entity_idf = {}
-        for p_hid, entity_weights in kg.edge_weights.items():
-            for e_hid in entity_weights:
-                if e_hid not in self._entity_idf:
-                    self._entity_idf[e_hid] = 0
-                self._entity_idf[e_hid] += 1
-        for e_hid in self._entity_idf:
-            self._entity_idf[e_hid] = np.log(num_passages / max(self._entity_idf[e_hid], 1))
+        for passage_hash_id, entity_weights in kg.edge_weights.items():
+            for entity_hash_id in entity_weights:
+                if entity_hash_id not in entity_hash_id_set:
+                    continue
+                self._entity_idf[entity_hash_id] = self._entity_idf.get(entity_hash_id, 0) + 1
+        for entity_hash_id in list(self._entity_idf.keys()):
+            self._entity_idf[entity_hash_id] = np.log(
+                num_passages / max(self._entity_idf[entity_hash_id], 1)
+            )
 
     def extract_seed_entities(self, query):
-        """Extract named entities from query and find closest indexed entities."""
-        query_entities = list(self.ner_extractor.question_ner(query))
-        if len(query_entities) == 0:
+        """Extract query entities and map them onto indexed canonical entities."""
+        if len(self._entity_hash_ids) == 0 or self._entity_embeddings.size == 0:
             return [], [], [], [], []
+
+        query_mentions = self.ner_extractor.extract_query_entities(query)
+        if not query_mentions:
+            return [], [], [], [], []
+
         query_entity_embeddings = self.embedding_model.encode(
-            query_entities, normalize_embeddings=True, show_progress_bar=False,
+            [mention["embedding_text"] for mention in query_mentions],
+            normalize_embeddings=True,
+            show_progress_bar=False,
             batch_size=self.config.batch_size,
-            prompt=self.config.query_instruction_prefix
+            prompt=self.config.query_instruction_prefix,
         )
         similarities = np.dot(self._entity_embeddings, query_entity_embeddings.T)
         seed_indices = []
         seed_texts = []
         seed_hash_ids = []
         seed_scores = []
-        for q_idx in range(len(query_entities)):
-            scores = similarities[:, q_idx]
-            best_idx = np.argmax(scores)
-            best_score = scores[best_idx]
+        for query_idx in range(len(query_mentions)):
+            scores = similarities[:, query_idx]
+            best_idx = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
             best_hash_id = self._entity_hash_ids[best_idx]
-            best_text = self.entity_embedding_store.hash_id_to_text[best_hash_id]
+            best_metadata = self.entity_nodes_by_hash.get(best_hash_id, {})
+            best_text = best_metadata.get(
+                "canonical_name",
+                self.entity_embedding_store.hash_id_to_text[best_hash_id],
+            )
             seed_indices.append(best_idx)
             seed_texts.append(best_text)
             seed_hash_ids.append(best_hash_id)
             seed_scores.append(best_score)
-        return query_entities, seed_indices, seed_texts, seed_hash_ids, seed_scores
+        return query_mentions, seed_indices, seed_texts, seed_hash_ids, seed_scores
 
     def _diffuse_from_seeds(self, query, query_embedding, seed_indices,
                             seed_hash_ids, seed_scores):
-        """Run frontier expansion + dual-channel evidence fusion.
-
-        Channel 1 (semantic): cosine(passage_embedding, query_embedding)
-        Channel 2 (coverage): activation-weighted entity coverage with IDF
-
-        final_score(p) = λ · semantic(p) + (1-λ) · coverage(p)
-        """
-        kg = self.knowledge_graph
-
+        """Run frontier expansion + dual-channel evidence fusion."""
         activated_entities = frontier_expansion(
             config=self.config,
-            hypergraph=kg._hypergraph,
+            hypergraph=self.knowledge_graph._hypergraph,
             entity_hash_ids=self._entity_hash_ids,
             su_embeddings=self._su_embeddings,
             question_embedding=query_embedding,
@@ -368,36 +440,33 @@ class Hyperflow:
             entity_embeddings=self._entity_embeddings,
         )
 
-        # Channel 1: Dense semantic similarity
         dense_sims = np.dot(self._passage_embeddings, query_embedding)
 
-        # Channel 2: Activation-weighted entity coverage with IDF
         coverage_scores = np.zeros(len(self._passage_hash_ids))
-        total_activation = sum(v[1] for v in activated_entities.values())
+        total_activation = sum(value[1] for value in activated_entities.values())
         if total_activation > 0:
-            for p_idx, p_hid in enumerate(self._passage_hash_ids):
-                if p_hid in kg.edge_weights:
-                    cov = 0.0
-                    for e_hid in kg.edge_weights[p_hid]:
-                        if e_hid in activated_entities:
-                            act_score = activated_entities[e_hid][1]
-                            idf = self._entity_idf.get(e_hid, 1.0)
-                            cov += act_score * idf
-                    coverage_scores[p_idx] = cov / total_activation
+            for passage_idx, passage_hash_id in enumerate(self._passage_hash_ids):
+                if passage_hash_id not in self.knowledge_graph.edge_weights:
+                    continue
+                coverage = 0.0
+                for entity_hash_id in self.knowledge_graph.edge_weights[passage_hash_id]:
+                    if entity_hash_id not in activated_entities:
+                        continue
+                    act_score = activated_entities[entity_hash_id][1]
+                    idf = self._entity_idf.get(entity_hash_id, 1.0)
+                    coverage += act_score * idf
+                coverage_scores[passage_idx] = coverage / total_activation
 
-        # Normalize both to [0, 1]
-        d_max = dense_sims.max()
-        dense_norm = dense_sims / d_max if d_max > 0 else dense_sims
-        c_max = coverage_scores.max()
-        coverage_norm = coverage_scores / c_max if c_max > 0 else coverage_scores
+        dense_max = dense_sims.max()
+        dense_norm = dense_sims / dense_max if dense_max > 0 else dense_sims
+        coverage_max = coverage_scores.max()
+        coverage_norm = coverage_scores / coverage_max if coverage_max > 0 else coverage_scores
 
-        # Fuse
         lam = self.config.scoring_lambda
         final_scores = lam * dense_norm + (1 - lam) * coverage_norm
 
-        # Sort and return
         sorted_indices = np.argsort(final_scores)[::-1]
-        sorted_hash_ids = [self._passage_hash_ids[i] for i in sorted_indices]
+        sorted_hash_ids = [self._passage_hash_ids[idx] for idx in sorted_indices]
         sorted_scores = final_scores[sorted_indices].tolist()
         return sorted_hash_ids, sorted_scores
 
@@ -413,7 +482,7 @@ class Hyperflow:
 
     def _rerank_passages(self, query, candidate_hash_ids, candidate_passages, top_k):
         """Rerank candidate passages using the reranker model."""
-        if len(candidate_passages) == 0:
+        if not candidate_passages:
             return [], [], []
         rerank_scores = self.reranker.score(query, candidate_passages)
         reranked_indices = np.argsort(np.asarray(rerank_scores))[::-1]
@@ -427,15 +496,7 @@ class Hyperflow:
     # ====== QA ======
 
     def rag_qa(self, queries, num_to_retrieve=None):
-        """Retrieve passages and generate answers for a list of queries.
-
-        Args:
-            queries: list of query strings
-            num_to_retrieve: number of passages per query (default: config.retrieval_top_k)
-
-        Returns:
-            list of dicts: [{"query": str, "answer": str, "passages": list[str]}, ...]
-        """
+        """Retrieve passages and generate answers for a list of queries."""
         retrieval_results = self.retrieve(queries, num_to_retrieve)
         system_prompt = (
             "As an advanced reading comprehension assistant, your task is to analyze text passages "
@@ -452,7 +513,7 @@ class Hyperflow:
             prompt_user += f"Question: {result['query']}\n Thought: "
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt_user}
+                {"role": "user", "content": prompt_user},
             ]
             all_messages.append(messages)
 
@@ -460,14 +521,13 @@ class Hyperflow:
             all_qa_results = list(tqdm(
                 executor.map(self.llm_model.infer, all_messages),
                 total=len(all_messages),
-                desc="QA Reading (Parallel)"
+                desc="QA Reading (Parallel)",
             ))
 
         for qa_result, result in zip(all_qa_results, retrieval_results):
             try:
-                answer = qa_result.split('Answer:')[1].strip()
+                answer = qa_result.split("Answer:")[1].strip()
             except Exception:
                 answer = qa_result
             result["answer"] = answer
         return retrieval_results
-

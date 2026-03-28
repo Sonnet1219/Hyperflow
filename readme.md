@@ -1,6 +1,6 @@
-# Hyperflow: Zero-Token Hypergraph Indexing for Single-Step Multi-Hop Retrieval
+# Hyperflow: Description-Aware Hypergraph Indexing for Single-Step Multi-Hop Retrieval
 
-> Hyperflow turns a document collection into a reasoning-ready hypergraph index. Instead of spending LLM tokens during offline graph construction, it uses NER-based hyperedge construction and frontier expansion to support single-step multi-hop retrieval for complex question answering.
+> Hyperflow turns a document collection into a reasoning-ready hypergraph index. It builds a semantic-unit hypergraph with LLM-extracted canonical entities and frontier expansion to support single-step multi-hop retrieval for complex question answering.
 
 ## Overview
 
@@ -9,7 +9,7 @@ Many existing GraphRAG systems rely on LLMs in the offline indexing stage to ext
 Hyperflow is designed to address both issues:
 
 - It builds a retrieval-oriented hypergraph directly from the corpus, without asking an LLM to generate explicit relations.
-- It uses entity recognition (spaCy or GLiNER) and semantic linking to construct hyperedges at near-zero token cost during indexing.
+- It uses LangExtract to produce semantic-unit mentions with grounded descriptions, then merges them into canonical entity nodes for hypergraph construction.
 - At query time, it performs hop-wise frontier expansion with conductance gating and progressive query steering, activating multiple related evidence chains in one retrieval pass.
 - This enables single-step multi-hop retrieval: instead of retrieving hop by hop, Hyperflow can connect scattered evidence across entities, semantic units, and passages in one shot.
 
@@ -17,25 +17,25 @@ Hyperflow is designed to address both issues:
 
 Hyperflow has two stages: offline indexing and online retrieval.
 
-### 1. Offline Indexing: Build a Hypergraph with Near-Zero Token Cost
+### 1. Offline Indexing: Build a Hypergraph from Semantic Units and Canonical Entities
 
 Given a corpus of passages, Hyperflow:
 
 1. Chunks the corpus into ~1200-token passages with overlap.
 2. Splits each passage into semantic units via Kamradt Percentile merging (embedding-based sentence grouping).
-3. Runs NER on each semantic unit to extract entities (GLiNER zero-shot or spaCy).
-4. Normalizes and deduplicates entities via text canonicalization and embedding-based merging.
-5. Treats each semantic unit as a hyperedge connecting all entities that co-occur in it.
+3. Runs LangExtract on each semantic unit to extract grounded entity mentions with short descriptions.
+4. Merges mention-level entities into canonical global entity nodes using normalized names plus embedding similarity.
+5. Treats each semantic unit as a hyperedge connecting all canonical entities that appear in it.
 6. Stores embeddings for passages, entities, and semantic units in Parquet files.
 7. Builds an auxiliary passage-entity graph for final ranking.
 
-No LLM is required during indexing. Hyperedges come directly from entity-semantic unit co-occurrence.
+Hyperedges come directly from canonical entity-semantic unit co-occurrence.
 
 ### 2. Online Retrieval: Single-Step Multi-Hop Reasoning
 
 For each question, Hyperflow:
 
-1. Extracts seed entities from the query via NER.
+1. Extracts seed entities from the query via LangExtract.
 2. Matches them to the nearest indexed entities by embedding similarity.
 3. Runs frontier expansion on the hypergraph:
    - Each hop discovers new entities through query-relevant semantic units, gated by conductance.
@@ -52,7 +52,7 @@ For each question, Hyperflow:
 
 Hyperflow models the corpus as an entity-semantic unit hypergraph:
 
-- **Vertices**: entities (extracted via NER, normalized and deduplicated)
+- **Vertices**: canonical entities (built from mention-level entity + description pairs)
 - **Hyperedges**: semantic units (sentence groups produced by Kamradt Percentile chunking)
 - **Incidence matrix H**: `H[v, e] = 1` iff entity `v` appears in semantic unit `e`
 
@@ -90,9 +90,9 @@ hyperflow/
   frontier.py             # Frontier expansion algorithm
   knowledge_graph.py      # Hypergraph structure, entity-passage graph
   embedding_store.py      # Parquet-backed embedding store
-  ner.py                  # NER backends (spaCy + GLiNER zero-shot)
+  ner.py                  # LangExtract-based mention extraction
   chunker.py              # Token chunking + Kamradt semantic unit splitting
-  entity_normalization.py # Text canonicalization + embedding-based entity merging
+  entity_normalization.py # Mention normalization + canonical entity merging
   reranker.py             # Qwen3 reranker
   utils.py                # LLM wrapper, hashing, logging utilities
 benchmarks/
@@ -116,7 +116,7 @@ python -m spacy download en_core_web_trf
 
 ### 3. Set your LLM API credentials
 
-Hyperflow uses an OpenAI-compatible chat completion API for final answer generation.
+Hyperflow uses an OpenAI-compatible chat completion API for both LangExtract-based indexing and final answer generation.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
@@ -134,7 +134,7 @@ By default, the code uses `BAAI/bge-large-en-v1.5` via sentence-transformers (do
 ```bash
 python benchmarks/graphrag_bench/run.py \
   --corpus_name medical \
-  --ner_backend gliner \
+  --langextract_model gpt-4o-mini \
   --expansion_max_hops 3 \
   --scoring_lambda 0.7
 ```
@@ -144,7 +144,7 @@ python benchmarks/graphrag_bench/run.py \
 ```bash
 python benchmarks/multihop/run.py \
   --dataset_name hotpotqa \
-  --ner_backend spacy \
+  --langextract_model gpt-4o-mini \
   --expansion_max_hops 3 \
   --scoring_lambda 0.7
 ```
@@ -161,14 +161,16 @@ python benchmarks/graphrag_bench/run.py \
 
 | Argument | Description | Default |
 | --- | --- | --- |
-| `--ner_backend` | NER engine: `gliner` (zero-shot) or `spacy` | `gliner` |
+| `--langextract_model` | Model used by LangExtract for mention extraction | `gpt-4o-mini` |
+| `--langextract_max_char_buffer` | Max char buffer per LangExtract extraction call | `1000` |
+| `--langextract_extraction_passes` | Sequential LangExtract passes for higher recall | `1` |
 | `--expansion_max_hops` | Max BFS hops from seed entities | `3` |
 | `--expansion_top_k` | New entities discovered per hop | `15` |
 | `--hop_decay` | Score decay per hop | `0.5` |
 | `--conductance_floor` | Query-SU similarity below this is suppressed | `0.3` |
 | `--conductance_gamma` | Conductance power exponent | `1.0` |
 | `--scoring_lambda` | Fusion weight (1.0 = pure dense, 0.0 = pure entity coverage) | `0.7` |
-| `--semantic_unit_percentile` | Kamradt percentile for SU boundary detection | `80` |
+| `--semantic_unit_percentile` | Kamradt percentile for SU boundary detection | `60` |
 | `--no_rerank` | Disable reranking | `false` |
 | `--reranker_model` | Reranker model path | `Qwen/Qwen3-Reranker-4B` |
 | `--reranker_candidate_top_k` | Candidates passed to reranker | `30` |
@@ -184,7 +186,8 @@ Stored under `index_store/<dataset_name>/`:
 | `passage_embedding.parquet` | Passage text + embeddings |
 | `entity_embedding.parquet` | Entity text + embeddings |
 | `su_embedding.parquet` | Semantic unit text + embeddings |
-| `ner_results.json` | Cached NER results (passage → entities, SU hash → entities) |
+| `ner_results.json` | Cached extraction results (passage → SU ids, SU hash → mention records) |
+| `entity_nodes.json` | Canonical entity node metadata |
 
 ### Run Outputs
 
@@ -196,7 +199,7 @@ Stored under `results/<dataset_name>/<timestamp>/`:
 
 ## Notes
 
-- Hyperflow avoids LLM usage in the indexing stage, but still uses an LLM for final answer generation.
+- Hyperflow now uses an LLM during indexing through LangExtract to create mention-level entities with grounded descriptions.
 - The reranker is loaded locally through Hugging Face Transformers and may require substantial GPU memory.
 - The default code path uses CUDA when available for embedding inference, hypergraph operations, and reranking.
 

@@ -45,6 +45,8 @@ class EmbeddingStore:
         existing = set(self.hash_ids)
         missing_ids = [h for h in all_hash_ids if h not in existing]
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
+        if not missing_ids:
+            return
         all_embeddings = self.embedding_model.encode(texts_to_encode, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
 
         self._upsert(missing_ids, texts_to_encode, all_embeddings)
@@ -73,3 +75,13 @@ class EmbeddingStore:
 
     def get_hash_id_to_text(self):
         return deepcopy(self.hash_id_to_text)
+
+    def clear(self):
+        self.hash_ids = []
+        self.texts = []
+        self.embeddings = []
+        self.hash_id_to_text = {}
+        self.hash_id_to_idx = {}
+        self.text_to_hash_id = {}
+        if os.path.exists(self.db_filename):
+            os.remove(self.db_filename)

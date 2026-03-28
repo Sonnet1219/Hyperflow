@@ -1,239 +1,249 @@
+"""LangExtract-based entity extraction for Hyperflow."""
+
+from __future__ import annotations
+
 import logging
-import re
+import os
 
-import spacy
+import langextract as lx
 
-from hyperflow.entity_normalization import EntityNormalizer, normalize_entity_list
+from hyperflow.entity_normalization import (
+    build_entity_embedding_text,
+    is_low_value_mention,
+    normalize_description,
+    normalize_entity_name,
+    normalize_entity_type,
+)
+from hyperflow.utils import compute_mdhash_id
 
 
 logger = logging.getLogger(__name__)
 
 
-MEDICAL_GLINER_LABELS = (
-    "disease or cancer type",
-    "disease abbreviation",
-    "symptom or clinical sign",
-    "risk factor or exposure",
-    "anatomy or body site",
-    "diagnostic test or imaging",
-    "pathology finding or histology",
-    "stage or grade",
-    "treatment or procedure",
-    "drug or regimen",
-    "biomarker or receptor",
-    "gene or mutation",
-)
+def _extract_description_value(extraction) -> str | None:
+    """Read the best available local description from a LangExtract extraction."""
+    if extraction.description:
+        return extraction.description
 
-NOVEL_GLINER_LABELS = (
-    "person",
-    "civilization",
-    "location",
-    "artifact",
-    "deity",
-    "language",
-    "historical event",
-    "ancient text or scripture",
-    "symbol or totem",
-    "architectural structure",
-)
+    attributes = extraction.attributes or {}
+    if not isinstance(attributes, dict):
+        return None
+
+    attr_description = attributes.get("description")
+    if isinstance(attr_description, str):
+        return attr_description
+    if isinstance(attr_description, list):
+        for value in attr_description:
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
 
 
-def get_gliner_labels_for_corpus(corpus_name: str) -> list[str]:
-    normalized_name = corpus_name.lower()
-    if "novel" in normalized_name:
-        return list(NOVEL_GLINER_LABELS)
-    return list(MEDICAL_GLINER_LABELS)
+LANGEXTRACT_PROMPT = """
+Extract only the key reusable entities from the text.
+
+Rules:
+- Use exact text spans from the source.
+- Extract only entities that are specific enough to connect evidence across different semantic units.
+- Favor people, groups, locations, events, artifacts, documents, organizations, medical entities, and other important named concepts.
+- Provide a short grounded description for each extraction that explains who or what it is in this local context.
+- Do not extract pronouns, generic references, vague abstractions, scene-setting objects, or long clause-like spans.
+- Do not return overlapping duplicates.
+- Use `extraction_class` as a coarse entity type.
+""".strip()
 
 
-class SpacyNER:
-    def __init__(self, spacy_model):
-        spacy.prefer_gpu()
-        self.spacy_model = spacy.load(spacy_model)
-        self.normalizer = EntityNormalizer(self.spacy_model)
-        logger.info("spaCy NER loaded with model: %s (GPU enabled)", spacy_model)
+LANGEXTRACT_EXAMPLES = [
+    lx.data.ExampleData(
+        text=(
+            "The travellers reached Kynance Cove before visiting "
+            "Landewednack, where the rector welcomed them."
+        ),
+        extractions=[
+            lx.data.Extraction(
+                extraction_class="location",
+                extraction_text="Kynance Cove",
+                description="coastal cove reached by the travellers",
+            ),
+            lx.data.Extraction(
+                extraction_class="location",
+                extraction_text="Landewednack",
+                description="Cornish village visited after the cove",
+            ),
+            lx.data.Extraction(
+                extraction_class="person",
+                extraction_text="the rector",
+                description="local rector who welcomed the visitors",
+            ),
+        ],
+    ),
+    lx.data.ExampleData(
+        text=(
+            "The biopsy confirmed Hodgkin lymphoma, and the patient "
+            "started ABVD chemotherapy."
+        ),
+        extractions=[
+            lx.data.Extraction(
+                extraction_class="test",
+                extraction_text="biopsy",
+                description="diagnostic procedure confirming the disease",
+            ),
+            lx.data.Extraction(
+                extraction_class="medical_condition",
+                extraction_text="Hodgkin lymphoma",
+                description="disease diagnosis confirmed by biopsy",
+            ),
+            lx.data.Extraction(
+                extraction_class="treatment",
+                extraction_text="ABVD chemotherapy",
+                description="chemotherapy regimen started for treatment",
+            ),
+        ],
+    ),
+]
 
-    def extract_entities_from_text(self, text):
-        """Extract entities from a single text string (semantic unit)."""
-        doc = self.spacy_model(text)
-        entities = set()
-        for ent in doc.ents:
-            if ent.label_ in ("ORDINAL", "CARDINAL"):
-                continue
-            entities.add(self.normalizer.canonicalize(ent.text.lower()))
-        return list(entities)
 
-    def question_ner(self, question: str):
-        doc = self.spacy_model(question)
-        question_entities = set()
-        for ent in doc.ents:
-            if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
-                continue
-            question_entities.add(self.normalizer.canonicalize(ent.text.lower()))
-        return question_entities
+class LangExtractExtractor:
+    """LLM-backed entity extraction with grounded descriptions."""
 
+    def __init__(
+        self,
+        model_id: str = "gpt-4o-mini",
+        api_key: str | None = None,
+        model_url: str | None = None,
+        max_char_buffer: int = 1000,
+        extraction_passes: int = 1,
+        max_workers: int = 10,
+        use_schema_constraints: bool = True,
+    ):
+        self.model_id = model_id
+        self.api_key = api_key or os.getenv("LANGEXTRACT_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.model_url = model_url or os.getenv("OPENAI_BASE_URL")
+        self.max_char_buffer = max_char_buffer
+        self.extraction_passes = max(1, extraction_passes)
+        self.max_workers = max(1, max_workers)
+        self.use_schema_constraints = use_schema_constraints
 
-class GLiNERExtractor:
-    """Zero-shot NER using GLiNER bi-encoder for domain-specific entity extraction."""
+        if self.model_id.startswith(("gpt-", "o1", "o3", "o4")) and not self.api_key:
+            raise ValueError(
+                "LangExtract extraction requires an API key. Set OPENAI_API_KEY or "
+                "LANGEXTRACT_API_KEY before indexing."
+            )
 
-    def __init__(self, model_name="knowledgator/gliner-bi-large-v2.0",
-                 labels=None, threshold=0.3, min_entity_length=3,
-                 enable_long_text_windowing=True, window_overlap_sentences=1,
-                 normalizer=None, device=None):
-        import torch
-        from gliner import GLiNER
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = GLiNER.from_pretrained(model_name).to(self.device)
-        self.labels = labels or []
-        self.threshold = threshold
-        self.min_length = min_entity_length
-        self.normalizer = normalizer
-        self.enable_long_text_windowing = enable_long_text_windowing
-        self.window_overlap_sentences = max(0, window_overlap_sentences)
-        self.max_length = getattr(self.model.config, "max_len", None)
-        self.sentencizer = self._build_sentencizer()
         logger.info(
-            "GLiNER loaded: model=%s, device=%s, labels=%s, threshold=%s, max_len=%s, long_text_windowing=%s, overlap_sentences=%s",
-            model_name,
-            self.device,
-            self.labels,
-            self.threshold,
-            self.max_length,
-            self.enable_long_text_windowing,
-            self.window_overlap_sentences,
+            "LangExtract loaded: model=%s, max_char_buffer=%s, extraction_passes=%s, max_workers=%s",
+            self.model_id,
+            self.max_char_buffer,
+            self.extraction_passes,
+            self.max_workers,
         )
 
-    def _build_sentencizer(self):
-        try:
-            nlp = spacy.blank("en")
-            if "sentencizer" not in nlp.pipe_names:
-                nlp.add_pipe("sentencizer")
-            return nlp
-        except Exception as exc:
-            logger.warning("Falling back to regex sentence splitting for GLiNER windowing: %s", exc)
+    def _extract_documents(self, documents):
+        return lx.extract(
+            text_or_documents=documents,
+            prompt_description=LANGEXTRACT_PROMPT,
+            examples=LANGEXTRACT_EXAMPLES,
+            model_id=self.model_id,
+            api_key=self.api_key,
+            model_url=self.model_url,
+            max_char_buffer=self.max_char_buffer,
+            extraction_passes=self.extraction_passes,
+            batch_length=max(self.max_workers, 10),
+            max_workers=self.max_workers,
+            use_schema_constraints=self.use_schema_constraints,
+            fetch_urls=False,
+            show_progress=False,
+            temperature=0.0,
+        )
+
+    def _build_mention_record(self, extraction, passage_hash_id: str, su_hash_id: str):
+        surface_text = (extraction.extraction_text or "").strip()
+        normalized_name = normalize_entity_name(surface_text)
+        entity_type = normalize_entity_type(extraction.extraction_class)
+        description = normalize_description(
+            _extract_description_value(extraction),
+            fallback_text=surface_text,
+        )
+
+        if is_low_value_mention(normalized_name, entity_type, description):
             return None
 
-    def _predict_entities(self, text):
-        return self.model.predict_entities(text, self.labels, threshold=self.threshold)
+        char_start = None
+        char_end = None
+        grounded = extraction.char_interval is not None
+        if grounded:
+            char_start = extraction.char_interval.start_pos
+            char_end = extraction.char_interval.end_pos
 
-    def _normalize_entity_texts(self, entities):
-        if self.normalizer is not None:
-            return normalize_entity_list(self.normalizer, entities, self.min_length)
-        normalized_entities = []
-        seen = set()
-        for entity in entities:
-            entity_text = entity["text"].lower().strip()
-            if len(entity_text) < self.min_length or entity_text in seen:
-                continue
-            seen.add(entity_text)
-            normalized_entities.append(entity_text)
-        return normalized_entities
+        mention_seed = f"{passage_hash_id}|{su_hash_id}|{normalized_name}|{char_start}|{char_end}"
+        return {
+            "mention_id": compute_mdhash_id(mention_seed, prefix="men-"),
+            "passage_hash_id": passage_hash_id,
+            "su_hash_id": su_hash_id,
+            "surface_text": surface_text,
+            "normalized_name": normalized_name,
+            "entity_type": entity_type,
+            "description": description,
+            "char_start": char_start,
+            "char_end": char_end,
+            "grounded": grounded,
+        }
 
-    def _tokenize_text(self, text):
-        tokens, _, _ = self.model.prepare_inputs([text])
-        return tokens[0]
+    def extract_mentions_from_su_batch(self, su_items, passage_hash_id: str) -> dict[str, list[dict]]:
+        """Extract mentions for a batch of semantic units from one passage."""
+        if not su_items:
+            return {}
 
-    def _split_into_sentences(self, text):
-        if self.sentencizer is not None:
-            doc = self.sentencizer(text)
-            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-            if sentences:
-                return sentences
-        return [segment.strip() for segment in re.split(r'(?<=[.!?])\s+', text) if segment.strip()]
-
-    def _hard_split_by_tokens(self, text):
-        tokens, starts, ends = self.model.prepare_inputs([text])
-        tokens = tokens[0]
-        starts = starts[0]
-        ends = ends[0]
-        if len(tokens) == 0:
-            return [text.strip()] if text.strip() else []
-
-        windows = []
-        start_idx = 0
-        while start_idx < len(tokens):
-            end_idx = min(start_idx + self.max_length, len(tokens))
-            window_text = text[starts[start_idx]:ends[end_idx - 1]].strip()
-            if window_text:
-                windows.append(window_text)
-            if end_idx >= len(tokens):
-                break
-            start_idx = end_idx
-        return windows
-
-    def _split_long_text_into_windows(self, text):
-        sentences = self._split_into_sentences(text)
-        if not sentences:
-            return self._hard_split_by_tokens(text)
-
-        sentence_tokens, _, _ = self.model.prepare_inputs(sentences)
-        filtered_sentences = [
-            (sentence, len(tokens))
-            for sentence, tokens in zip(sentences, sentence_tokens)
-            if len(tokens) > 0
+        documents = [
+            lx.data.Document(text=su_text, document_id=su_hash_id)
+            for su_hash_id, su_text in su_items
         ]
-        if not filtered_sentences:
-            return self._hard_split_by_tokens(text)
+        document_results = self._extract_documents(documents)
+        mentions_by_su = {su_hash_id: [] for su_hash_id, _ in su_items}
 
-        sentences = [sentence for sentence, _ in filtered_sentences]
-        token_counts = [token_count for _, token_count in filtered_sentences]
-
-        windows = []
-        start_sentence_idx = 0
-        while start_sentence_idx < len(sentences):
-            if token_counts[start_sentence_idx] > self.max_length:
-                windows.extend(self._hard_split_by_tokens(sentences[start_sentence_idx]))
-                start_sentence_idx += 1
-                continue
-
-            end_sentence_idx = start_sentence_idx
-            token_count = token_counts[start_sentence_idx]
-            while (
-                end_sentence_idx + 1 < len(sentences)
-                and token_count + token_counts[end_sentence_idx + 1] <= self.max_length
-            ):
-                end_sentence_idx += 1
-                token_count += token_counts[end_sentence_idx]
-
-            window_text = " ".join(sentences[start_sentence_idx:end_sentence_idx + 1]).strip()
-            if window_text:
-                windows.append(window_text)
-
-            if end_sentence_idx >= len(sentences) - 1:
-                break
-
-            covered_sentence_count = end_sentence_idx - start_sentence_idx + 1
-            overlap = min(self.window_overlap_sentences, covered_sentence_count - 1)
-            start_sentence_idx = end_sentence_idx - overlap + 1
-
-        return windows or self._hard_split_by_tokens(text)
-
-    def extract_entities_from_text(self, text):
-        """Extract entities from a single text string (semantic unit)."""
-        if not self.enable_long_text_windowing or not self.max_length:
-            return self._normalize_entity_texts(self._predict_entities(text))
-
-        token_count = len(self._tokenize_text(text))
-        if token_count <= self.max_length:
-            return self._normalize_entity_texts(self._predict_entities(text))
-
-        window_texts = self._split_long_text_into_windows(text)
-        extracted_entities = []
-        seen = set()
-        for window_text in window_texts:
-            for entity_text in self._normalize_entity_texts(self._predict_entities(window_text)):
-                if entity_text in seen:
+        for annotated_document in document_results:
+            su_hash_id = annotated_document.document_id
+            seen = set()
+            for extraction in annotated_document.extractions or []:
+                mention = self._build_mention_record(extraction, passage_hash_id, su_hash_id)
+                if mention is None:
                     continue
-                seen.add(entity_text)
-                extracted_entities.append(entity_text)
+                dedupe_key = (
+                    mention["normalized_name"],
+                    mention["entity_type"],
+                    mention["description"],
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                mentions_by_su.setdefault(su_hash_id, []).append(mention)
+        return mentions_by_su
 
-        logger.debug(
-            "Windowed GLiNER extraction split a %s-token semantic unit into %s windows",
-            token_count,
-            len(window_texts),
-        )
-        return extracted_entities
-
-    def question_ner(self, question: str):
-        """Extract entities from a question for seed matching."""
-        entities = self._predict_entities(question)
-        return set(self._normalize_entity_texts(entities))
+    def extract_query_entities(self, query: str) -> list[dict]:
+        """Extract query entities using the same schema as index-time mentions."""
+        result = self._extract_documents(query)
+        query_mentions = []
+        seen = set()
+        for extraction in result.extractions or []:
+            surface_text = (extraction.extraction_text or "").strip()
+            normalized_name = normalize_entity_name(surface_text)
+            entity_type = normalize_entity_type(extraction.extraction_class)
+            description = normalize_description(
+                _extract_description_value(extraction),
+                fallback_text=surface_text,
+            )
+            if is_low_value_mention(normalized_name, entity_type, description):
+                continue
+            embedding_text = build_entity_embedding_text(normalized_name, description)
+            dedupe_key = (normalized_name, entity_type, description)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            query_mentions.append({
+                "surface_text": surface_text,
+                "normalized_name": normalized_name,
+                "entity_type": entity_type,
+                "description": description,
+                "embedding_text": embedding_text,
+            })
+        return query_mentions

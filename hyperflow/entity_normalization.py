@@ -1,189 +1,342 @@
-"""Entity text normalization for deduplication across semantic units.
+"""Entity normalization and mention-to-node merging for Hyperflow."""
 
-Applies deterministic canonicalization rules so that surface variants
-of the same entity (plural, article prefix, hyphen, parenthetical)
-collapse to a single canonical form before the seen-set check.
+from __future__ import annotations
 
-Also provides embedding-based merging for semantically equivalent
-entities that survive text-level canonicalization.
-"""
-
-import re
+from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 import logging
+import re
+
 import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
 _ARTICLE_RE = re.compile(r"^(?:the|an|a)\s+", re.IGNORECASE)
-_SPACED_PAREN_RE = re.compile(r"\s+\([^)]*\)")  # only match parentheticals preceded by whitespace
+_SPACED_PAREN_RE = re.compile(r"\s+\([^)]*\)")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
+_EDGE_PUNCT_RE = re.compile(r"^[^\w]+|[^\w]+$")
+_POSSESSIVE_RE = re.compile(r"(?:'s|’s)$")
+
+_LOW_SIGNAL_NAMES = {
+    "he",
+    "she",
+    "they",
+    "them",
+    "him",
+    "her",
+    "his",
+    "their",
+    "hers",
+    "theirs",
+    "someone",
+    "some one",
+    "somebody",
+    "something",
+    "one of us",
+    "one",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+}
+
+_LOW_SIGNAL_TYPES = {"pronoun", "reference", "generic", "other"}
 
 
-class EntityNormalizer:
-    """Stateless text canonicalizer backed by a spaCy model for lemmatization."""
-
-    def __init__(self, spacy_model):
-        self._nlp = spacy_model
-
-    def canonicalize(self, text: str) -> str:
-        """Apply canonicalization rules in fixed order.
-
-        Order:
-            1. Strip leading articles  (the/a/an)
-            2. Remove parenthetical content
-            3. Normalize hyphens to spaces
-            4. Lemmatize via spaCy
-            5. Collapse whitespace and strip
-        """
-        # Step 1: strip articles
-        text = _ARTICLE_RE.sub("", text)
-
-        # Step 2: remove parenthetical content
-        # Handle "(s)" suffix first: drug(s) → drug, sentinel lymph node(s) → sentinel lymph node
-        text = text.replace("(s)", "")
-        # Remove parenthetical annotations preceded by a space: "squamous cell (epidermoid) carcinoma"
-        # but preserve identifiers like "t(11;22)" or "del(5q)" where "(" directly follows text
-        text = _SPACED_PAREN_RE.sub("", text)
-
-        # Step 3: hyphens → spaces
-        text = text.replace("-", " ")
-
-        # Step 4: lemmatize
-        text = self._lemmatize(text)
-
-        # Step 5: collapse whitespace
-        text = _MULTI_SPACE_RE.sub(" ", text).strip()
-
-        return text
-
-    def _lemmatize(self, text: str) -> str:
-        doc = self._nlp(text)
-        parts = []
-        for token in doc:
-            lemma = token.lemma_ if token.pos_ == "NOUN" else token.text
-            parts.append(lemma + token.whitespace_)
-        return "".join(parts)
+def normalize_entity_name(text: str) -> str:
+    """Normalize an entity surface form into a merge key."""
+    text = (text or "").strip().lower()
+    text = _ARTICLE_RE.sub("", text)
+    text = text.replace("(s)", "")
+    text = _SPACED_PAREN_RE.sub("", text)
+    text = text.replace("-", " ").replace("/", " / ")
+    text = _POSSESSIVE_RE.sub("", text)
+    text = _EDGE_PUNCT_RE.sub("", text)
+    text = _MULTI_SPACE_RE.sub(" ", text).strip()
+    return text
 
 
-def normalize_entity_list(normalizer: EntityNormalizer,
-                          raw_entities: list[dict],
-                          min_length: int = 3) -> list[str]:
-    """Normalize and deduplicate a list of GLiNER-style entity dicts.
-
-    Each dict must have a ``"text"`` key.  Returns deduplicated canonical
-    entity strings in first-seen order.
-    """
-    normalized = []
-    seen: set[str] = set()
-    for entity in raw_entities:
-        text = entity["text"].lower().strip()
-        text = normalizer.canonicalize(text)
-        if len(text) < min_length or text in seen:
-            continue
-        seen.add(text)
-        normalized.append(text)
-    return normalized
+def normalize_entity_type(entity_type: str | None) -> str:
+    """Normalize the coarse entity type for stable comparisons."""
+    normalized = (entity_type or "entity").strip().lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    normalized = _MULTI_SPACE_RE.sub("_", normalized)
+    return normalized or "entity"
 
 
-def merge_similar_entities(entity_texts, embedding_model,
-                           passage_entities: dict, su_entities: dict,
-                           threshold: float = 0.93, batch_size: int = 128):
-    """Merge semantically similar entities using embedding cosine similarity.
+def normalize_description(description: str | None, fallback_text: str = "") -> str:
+    """Normalize a local description while preserving simple readability."""
+    text = (description or fallback_text or "").strip().lower()
+    text = text.strip(" .;,:")
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    return text
 
-    Entities with similarity >= threshold are grouped via union-find.
-    Within each group the shortest text (ties broken alphabetically)
-    becomes the canonical representative.
 
-    This function operates on raw text lists *before* store insertion,
-    so only canonical entities need to be inserted into the EmbeddingStore.
+def build_entity_embedding_text(name: str, description: str | None = None) -> str:
+    """Compose the text used for entity embeddings and retrieval matching."""
+    name = normalize_entity_name(name)
+    description = normalize_description(description)
+    if description:
+        return f"{name}: {description}"
+    return name
 
-    Args:
-        entity_texts: list of unique entity strings to check.
-        embedding_model: SentenceTransformer used for encoding.
-        passage_entities: {passage_hash_id: [entity_text, ...]}
-        su_entities: {su_text: [entity_text, ...]}
-        threshold: cosine similarity threshold for merging.
-        batch_size: encoding batch size.
 
-    Returns:
-        (canonical_entity_texts, updated_passage_entities, updated_su_entities, alias_map)
-    """
-    texts = list(entity_texts)
-    if len(texts) < 2:
-        return texts, passage_entities, su_entities, {}
+def is_low_value_mention(name: str, entity_type: str, description: str) -> bool:
+    """Filter mentions that are too generic to become useful graph nodes."""
+    if not name:
+        return True
+    if entity_type in _LOW_SIGNAL_TYPES:
+        return True
+    if name in _LOW_SIGNAL_NAMES:
+        return True
+    if len(name) < 3:
+        return True
+    if len(name.split()) > 8:
+        return True
+    alnum_chars = sum(ch.isalnum() for ch in name)
+    if alnum_chars < 3:
+        return True
+    if not description:
+        return True
+    return False
+
+
+def _name_similarity(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    jaccard = len(tokens_a & tokens_b) / max(len(tokens_a | tokens_b), 1)
+    containment = 0.0
+    if a in b or b in a:
+        containment = min(len(a), len(b)) / max(len(a), len(b), 1)
+    seq = SequenceMatcher(None, a, b).ratio()
+    return max(jaccard, containment, seq)
+
+
+def _choose_canonical_name(mentions: list[dict]) -> str:
+    counts = Counter(m["normalized_name"] for m in mentions)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
+    return ranked[0][0]
+
+
+def _choose_entity_type(mentions: list[dict]) -> str:
+    counts = Counter(m["entity_type"] for m in mentions)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return ranked[0][0]
+
+
+def _choose_canonical_description(
+    descriptions: list[str], embedding_model, batch_size: int
+) -> str:
+    unique_descriptions = list(dict.fromkeys(d for d in descriptions if d))
+    if not unique_descriptions:
+        return ""
+    if len(unique_descriptions) == 1:
+        return unique_descriptions[0]
 
     embeddings = embedding_model.encode(
-        texts, normalize_embeddings=True, show_progress_bar=False,
+        unique_descriptions,
+        normalize_embeddings=True,
+        show_progress_bar=False,
         batch_size=batch_size,
     )
     embeddings = np.asarray(embeddings)
+    similarity = embeddings @ embeddings.T
+    mean_similarity = similarity.mean(axis=1)
+    best_idx = int(np.argmax(mean_similarity))
+    return unique_descriptions[best_idx]
 
-    # Pairwise cosine similarity
-    sim = embeddings @ embeddings.T
-    np.fill_diagonal(sim, 0)
 
-    # Union-Find
-    parent = list(range(len(texts)))
+def _make_cluster(mentions: list[dict], embedding_model, batch_size: int) -> dict:
+    canonical_name = _choose_canonical_name(mentions)
+    canonical_description = _choose_canonical_description(
+        [m["description"] for m in mentions], embedding_model, batch_size
+    )
+    entity_type = _choose_entity_type(mentions)
+    aliases = sorted({m["surface_text"].strip() for m in mentions if m["surface_text"].strip()})
+    description_variants = list(
+        dict.fromkeys(m["description"] for m in mentions if m["description"])
+    )
+    supporting_su_ids = sorted({m["su_hash_id"] for m in mentions})
+    supporting_passage_ids = sorted({m["passage_hash_id"] for m in mentions})
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+    return {
+        "canonical_name": canonical_name,
+        "canonical_description": canonical_description,
+        "entity_type": entity_type,
+        "aliases": aliases,
+        "description_variants": description_variants,
+        "member_mentions": mentions,
+        "supporting_su_ids": supporting_su_ids,
+        "supporting_passage_ids": supporting_passage_ids,
+        "embedding_text": build_entity_embedding_text(canonical_name, canonical_description),
+    }
 
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
 
-    rows, cols = np.where(sim >= threshold)
-    for i, j in zip(rows, cols):
-        if i < j:
-            union(i, j)
+def _cluster_similarity(cluster_a: dict, cluster_b: dict) -> float:
+    return _name_similarity(cluster_a["canonical_name"], cluster_b["canonical_name"])
 
-    # Group entities by connected component
-    groups = {}
-    for idx in range(len(texts)):
-        root = find(idx)
-        groups.setdefault(root, []).append(idx)
 
-    # Build alias map: old_text -> canonical_text
-    alias_map = {}
-    for members in groups.values():
-        if len(members) == 1:
+def _can_merge(cluster_a: dict, cluster_b: dict, similarity: float) -> bool:
+    if cluster_a["entity_type"] != cluster_b["entity_type"]:
+        return False
+    name_score = _cluster_similarity(cluster_a, cluster_b)
+    if name_score < 0.72:
+        return False
+    return similarity >= 0.90
+
+
+def merge_entity_mentions(
+    mentions: list[dict],
+    su_text_by_hash: dict[str, str],
+    embedding_model,
+    similarity_threshold: float = 0.90,
+    batch_size: int = 128,
+):
+    """Merge SU-level mentions into canonical entity nodes.
+
+    Returns:
+        entity_nodes: list[dict]
+        passage_entities: {passage_hash_id: [entity_embedding_text, ...]}
+        su_entities: {su_text: [entity_embedding_text, ...]}
+        passage_entity_counts: {passage_hash_id: {entity_embedding_text: count}}
+    """
+    filtered_mentions = []
+    for mention in mentions:
+        mention = dict(mention)
+        mention["normalized_name"] = normalize_entity_name(mention.get("normalized_name") or mention.get("surface_text", ""))
+        mention["entity_type"] = normalize_entity_type(mention.get("entity_type"))
+        mention["description"] = normalize_description(
+            mention.get("description"),
+            fallback_text=mention.get("surface_text", ""),
+        )
+        if is_low_value_mention(
+            mention["normalized_name"], mention["entity_type"], mention["description"]
+        ):
             continue
-        member_texts = [(texts[i], i) for i in members]
-        member_texts.sort(key=lambda x: (len(x[0]), x[0]))
-        canonical = member_texts[0][0]
-        for text, _ in member_texts[1:]:
-            alias_map[text] = canonical
+        filtered_mentions.append(mention)
 
-    if not alias_map:
-        logger.info("Entity merge: no pairs above threshold %.2f", threshold)
-        return texts, passage_entities, su_entities, alias_map
+    if not filtered_mentions:
+        logger.info("Entity merge: no valid mentions after filtering")
+        return [], {}, {}, {}
 
-    logger.info("Entity merge: %d entities merged into %d groups (threshold=%.2f)",
-                len(alias_map), len([m for m in groups.values() if len(m) > 1]),
-                threshold)
+    exact_groups = defaultdict(list)
+    for mention in filtered_mentions:
+        # Hard-cluster by normalized name only so same-name mentions can vote on type.
+        exact_groups[mention["normalized_name"]].append(mention)
 
-    # Filter to canonical entities only
-    canonical_texts = [t for t in texts if t not in alias_map]
+    initial_clusters = [
+        _make_cluster(group_mentions, embedding_model, batch_size)
+        for group_mentions in exact_groups.values()
+    ]
+    logger.info(
+        "Entity merge: %d mentions -> %d exact clusters",
+        len(filtered_mentions),
+        len(initial_clusters),
+    )
 
-    # Apply alias map to passage_entities and su_entities
-    def _apply(entity_dict):
-        updated = {}
-        for key, ents in entity_dict.items():
-            seen = set()
-            new_ents = []
-            for e in ents:
-                canonical = alias_map.get(e, e)
-                if canonical not in seen:
-                    seen.add(canonical)
-                    new_ents.append(canonical)
-            updated[key] = new_ents
-        return updated
+    if len(initial_clusters) == 1:
+        merged_clusters = initial_clusters
+    else:
+        cluster_embeddings = embedding_model.encode(
+            [cluster["embedding_text"] for cluster in initial_clusters],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=batch_size,
+        )
+        cluster_embeddings = np.asarray(cluster_embeddings)
+        similarity_matrix = cluster_embeddings @ cluster_embeddings.T
 
-    updated_passage = _apply(passage_entities)
-    updated_su = _apply(su_entities)
+        parent = list(range(len(initial_clusters)))
 
-    return canonical_texts, updated_passage, updated_su, alias_map
+        def find(idx: int) -> int:
+            while parent[idx] != idx:
+                parent[idx] = parent[parent[idx]]
+                idx = parent[idx]
+            return idx
+
+        def union(a: int, b: int) -> None:
+            root_a = find(a)
+            root_b = find(b)
+            if root_a != root_b:
+                parent[root_a] = root_b
+
+        rows, cols = np.where(similarity_matrix >= similarity_threshold)
+        for i, j in zip(rows.tolist(), cols.tolist()):
+            if i >= j:
+                continue
+            similarity = float(similarity_matrix[i, j])
+            if _can_merge(initial_clusters[i], initial_clusters[j], similarity):
+                union(i, j)
+
+        merged_members = defaultdict(list)
+        for idx, cluster in enumerate(initial_clusters):
+            merged_members[find(idx)].extend(cluster["member_mentions"])
+
+        merged_clusters = [
+            _make_cluster(group_mentions, embedding_model, batch_size)
+            for group_mentions in merged_members.values()
+        ]
+
+    entity_nodes = []
+    passage_entities = defaultdict(list)
+    su_entities = defaultdict(list)
+    passage_entity_counts = defaultdict(lambda: defaultdict(float))
+
+    for cluster in merged_clusters:
+        mentions_in_cluster = cluster["member_mentions"]
+        embedding_text = cluster["embedding_text"]
+        canonical_name = cluster["canonical_name"]
+        canonical_description = cluster["canonical_description"]
+
+        entity_node = {
+            "canonical_name": canonical_name,
+            "canonical_description": canonical_description,
+            "entity_type": cluster["entity_type"],
+            "aliases": cluster["aliases"],
+            "description_variants": cluster["description_variants"],
+            "supporting_su_ids": cluster["supporting_su_ids"],
+            "supporting_passage_ids": cluster["supporting_passage_ids"],
+            "mention_ids": [m["mention_id"] for m in mentions_in_cluster],
+            "mention_count": len(mentions_in_cluster),
+            "su_count": len(cluster["supporting_su_ids"]),
+            "passage_count": len(cluster["supporting_passage_ids"]),
+            "embedding_text": embedding_text,
+        }
+        entity_nodes.append(entity_node)
+
+        seen_sus = set()
+        seen_passages = set()
+        for mention in mentions_in_cluster:
+            su_hash_id = mention["su_hash_id"]
+            passage_hash_id = mention["passage_hash_id"]
+            su_text = su_text_by_hash.get(su_hash_id)
+            if su_text is None:
+                continue
+            if su_hash_id not in seen_sus:
+                su_entities[su_text].append(embedding_text)
+                seen_sus.add(su_hash_id)
+            if passage_hash_id not in seen_passages:
+                passage_entities[passage_hash_id].append(embedding_text)
+                seen_passages.add(passage_hash_id)
+            passage_entity_counts[passage_hash_id][embedding_text] += 1.0
+
+    entity_nodes.sort(key=lambda node: node["embedding_text"])
+    for passage_hash_id in passage_entities:
+        passage_entities[passage_hash_id] = list(dict.fromkeys(passage_entities[passage_hash_id]))
+    for su_text in su_entities:
+        su_entities[su_text] = list(dict.fromkeys(su_entities[su_text]))
+
+    logger.info(
+        "Entity merge: %d mentions -> %d canonical entities",
+        len(filtered_mentions),
+        len(entity_nodes),
+    )
+    return entity_nodes, dict(passage_entities), dict(su_entities), {
+        passage_hash_id: dict(weights)
+        for passage_hash_id, weights in passage_entity_counts.items()
+    }

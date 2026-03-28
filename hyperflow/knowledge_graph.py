@@ -110,19 +110,30 @@ class KnowledgeGraph:
                 su_store.text_to_hash_id[s] for s in sus
             ]
 
-    def link_entities_to_passages(self, passage_to_entities, passage_store, entity_store):
+    def link_entities_to_passages(
+        self,
+        passage_to_entities,
+        passage_store,
+        entity_store,
+        passage_entity_counts=None,
+    ):
         """Create weighted edges between passages and their contained entities."""
         passage_entity_count = {}
-        passage_total_count = defaultdict(int)
+        passage_total_count = defaultdict(float)
         for passage_hash_id, entities in passage_to_entities.items():
             passage_text = passage_store.hash_id_to_text[passage_hash_id]
+            weights = (passage_entity_counts or {}).get(passage_hash_id, {})
             for entity in entities:
                 entity_hash_id = entity_store.text_to_hash_id[entity]
-                count = passage_text.count(entity)
+                if entity in weights:
+                    count = float(weights[entity])
+                else:
+                    count = float(passage_text.count(entity))
                 passage_entity_count[(passage_hash_id, entity_hash_id)] = count
                 passage_total_count[passage_hash_id] += count
         for (passage_hash_id, entity_hash_id), count in passage_entity_count.items():
-            weight = count / passage_total_count[passage_hash_id] if passage_total_count[passage_hash_id] > 0 else 0
+            total = passage_total_count[passage_hash_id]
+            weight = count / total if total > 0 else 0.0
             self.edge_weights[passage_hash_id][entity_hash_id] = weight
 
     def link_adjacent_passages(self, passage_store):

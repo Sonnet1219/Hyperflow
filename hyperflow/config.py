@@ -1,6 +1,4 @@
-from dataclasses import dataclass, field
-
-from hyperflow.ner import MEDICAL_GLINER_LABELS
+from dataclasses import dataclass
 
 
 @dataclass
@@ -15,21 +13,15 @@ class HyperflowConfig:
     batch_size: int = 128
     max_workers: int = 16
     retrieval_top_k: int = 5
-    # Dual-channel passage scoring
-    scoring_lambda: float = 0.5             # fusion weight (1.0 = pure dense, 0.0 = pure entity coverage)
-    # Frontier expansion parameters
-    expansion_max_hops: int = 3             # max BFS hops from seed entities
-    expansion_top_k: int = 15              # new entities discovered per hop
-    hop_decay: float = 0.5                  # score decay per hop (score × decay^hop)
-    # SU conductance gating
-    conductance_floor: float = 0.5          # query-SU sim below this -> zero conductance
-    conductance_gamma: float = 1.0          # power exponent (1.0 = linear, < 1 broadens, > 1 sharpens)
-    # Progressive Query Steering
-    steering_alpha: float = 0.7             # retain ratio of original query (1.0 = no steering)
-    steering_top_k: int = 3                 # top-K activated entities for centroid computation
-    # Semantic unit chunking
-    semantic_unit_percentile: int = 60      # Kamradt percentile for SU boundary detection
-    # Reranker
+    scoring_lambda: float = 0.5
+    expansion_max_hops: int = 3
+    expansion_top_k: int = 15
+    hop_decay: float = 0.5
+    conductance_floor: float = 0.5
+    conductance_gamma: float = 1.0
+    steering_alpha: float = 0.7
+    steering_top_k: int = 3
+    semantic_unit_percentile: int = 60
     use_reranker: bool = True
     reranker_model_name: str = "Qwen/Qwen3-Reranker-4B"
     reranker_candidate_top_k: int = 30
@@ -39,11 +31,10 @@ class HyperflowConfig:
         "Given a multi-hop question, judge whether the document contains evidence "
         "that helps answer the question, either directly or as an intermediate bridge."
     )
-    # NER backend
-    ner_backend: str = "gliner"             # "gliner" or "spacy"
-    gliner_model: str = "urchade/gliner_large-v2.1"
-    gliner_threshold: float = 0.3
-    gliner_labels: list[str] = field(default_factory=lambda: list(MEDICAL_GLINER_LABELS))
-    enable_gliner_long_text_windowing: bool = True
-    gliner_window_overlap_sentences: int = 1
-    min_entity_length: int = 3
+    langextract_model_id: str = "gpt-4o-mini"
+    langextract_api_key: str | None = None
+    langextract_model_url: str | None = None
+    langextract_max_char_buffer: int = 1000
+    langextract_extraction_passes: int = 1
+    langextract_use_schema_constraints: bool = True
+    entity_merge_threshold: float = 0.90
