@@ -68,7 +68,7 @@ def parse_arguments():
     parser.add_argument("--expansion_max_hops", type=int, default=3, help="Max BFS hops from seed entities")
     parser.add_argument("--expansion_top_k", type=int, default=15, help="New entities discovered per hop")
     parser.add_argument("--hop_decay", type=float, default=0.5, help="Score decay per hop")
-    parser.add_argument("--conductance_floor", type=float, default=0.3, help="SU conductance floor")
+    parser.add_argument("--conductance_floor", type=float, default=0.5, help="SU conductance floor")
     parser.add_argument("--conductance_gamma", type=float, default=1.0, help="SU conductance power exponent")
     parser.add_argument("--scoring_lambda", type=float, default=0.7, help="Dual-channel fusion weight (1.0=dense, 0.0=entity)")
 

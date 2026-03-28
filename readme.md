@@ -272,7 +272,7 @@ python benchmarks/graphrag_bench/run.py \
   --langextract_model gpt-4o-mini \
   --expansion_max_hops 3 \
   --expansion_top_k 15 \
-  --conductance_floor 0.3 \
+  --conductance_floor 0.5 \
   --conductance_gamma 1.0 \
   --scoring_lambda 0.7
 ```
