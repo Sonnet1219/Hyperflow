@@ -1,4 +1,4 @@
-"""LangExtract-based entity extraction for Hyperflow."""
+"""LangExtract-based entity extraction for HyperSU."""
 
 from __future__ import annotations
 
@@ -7,14 +7,14 @@ import os
 
 import langextract as lx
 
-from hyperflow.entity_normalization import (
+from hypersu.entity_normalization import (
     build_entity_embedding_text,
     is_low_value_mention,
     normalize_description,
     normalize_entity_name,
     normalize_entity_type,
 )
-from hyperflow.utils import compute_mdhash_id
+from hypersu.utils import compute_mdhash_id
 
 
 logger = logging.getLogger(__name__)

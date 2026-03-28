@@ -96,7 +96,7 @@ def load_questions(corpus_name: str) -> list[dict]:
 
 
 def format_results(retrieval_results: list[dict], questions: list[dict]) -> list[dict]:
-    """Convert Hyperflow output to GraphRAG-Bench unified JSON format.
+    """Convert HyperSU output to GraphRAG-Bench unified JSON format.
 
     Output matches the official format expected by:
         python -m Evaluation.generation_eval --data_file <output>
@@ -106,7 +106,7 @@ def format_results(retrieval_results: list[dict], questions: list[dict]) -> list
     evidence (str), question_type, generated_answer, ground_truth
 
     Args:
-        retrieval_results: Output from Hyperflow qa() -- list of dicts with
+        retrieval_results: Output from HyperSU qa() -- list of dicts with
             question, sorted_passage, pred_answer, gold_answer
         questions: Original question dicts with id, source, question_type, evidence
 

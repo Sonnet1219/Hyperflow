@@ -1,5 +1,5 @@
 from copy import deepcopy
-from hyperflow.utils import compute_mdhash_id
+from hypersu.utils import compute_mdhash_id
 import pandas as pd
 import os
 import logging

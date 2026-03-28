@@ -1,4 +1,4 @@
-"""Entity normalization and mention-to-node merging for Hyperflow."""
+"""Entity normalization and mention-to-node merging for HyperSU."""
 
 from __future__ import annotations
 

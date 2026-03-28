@@ -1,6 +1,6 @@
 import json
 import os
-from hyperflow.utils import normalize_answer
+from hypersu.utils import normalize_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging

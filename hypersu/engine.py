@@ -1,4 +1,4 @@
-"""Hyperflow: Hypergraph-based retrieval-augmented generation engine."""
+"""HyperSU: Hypergraph-based retrieval-augmented generation engine."""
 
 from __future__ import annotations
 
@@ -13,30 +13,30 @@ import torch
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from hyperflow.chunker import create_semantic_units
-from hyperflow.config import HyperflowConfig
-from hyperflow.embedding_store import EmbeddingStore
-from hyperflow.entity_normalization import merge_entity_mentions
-from hyperflow.frontier import frontier_expansion
-from hyperflow.knowledge_graph import KnowledgeGraph, dense_retrieval
-from hyperflow.ner import LangExtractExtractor
-from hyperflow.reranker import QwenReranker
-from hyperflow.utils import LLM_Model, compute_mdhash_id
+from hypersu.chunker import create_semantic_units
+from hypersu.config import HyperSUConfig
+from hypersu.embedding_store import EmbeddingStore
+from hypersu.entity_normalization import merge_entity_mentions
+from hypersu.frontier import frontier_expansion
+from hypersu.knowledge_graph import KnowledgeGraph, dense_retrieval
+from hypersu.ner import LangExtractExtractor
+from hypersu.reranker import QwenReranker
+from hypersu.utils import LLM_Model, compute_mdhash_id
 
 
 logger = logging.getLogger(__name__)
 
 
-class Hyperflow:
+class HyperSU:
     def __init__(self, save_dir="./output", llm_model_name="gpt-4o-mini",
                  embedding_model_name="BAAI/bge-large-en-v1.5", **kwargs):
-        self.config = HyperflowConfig(
+        self.config = HyperSUConfig(
             save_dir=save_dir,
             embedding_model_name=embedding_model_name,
             llm_model_name=llm_model_name,
             **kwargs,
         )
-        logger.info("Initializing Hyperflow with config: %s", self.config)
+        logger.info("Initializing HyperSU with config: %s", self.config)
         logger.info("Retrieval method: Frontier Expansion")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

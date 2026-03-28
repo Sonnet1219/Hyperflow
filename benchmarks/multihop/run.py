@@ -1,4 +1,4 @@
-"""Run Hyperflow on multi-hop QA datasets (HotpotQA, 2WikiMultiHop, MuSiQue)."""
+"""Run HyperSU on multi-hop QA datasets (HotpotQA, 2WikiMultiHop, MuSiQue)."""
 
 import argparse
 import json
@@ -9,11 +9,11 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
-# Ensure project root is on sys.path so `hyperflow` is importable
+# Ensure project root is on sys.path so `hypersu` is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from hyperflow.engine import Hyperflow
-from hyperflow.utils import LLM_Model, setup_logging
+from hypersu.engine import HyperSU
+from hypersu.utils import LLM_Model, setup_logging
 from evaluate import Evaluator
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -31,7 +31,7 @@ AVAILABLE_DATASETS = ("hotpotqa", "2wikimultihop", "musique")
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run Hyperflow on multi-hop QA datasets")
+    parser = argparse.ArgumentParser(description="Run HyperSU on multi-hop QA datasets")
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf", help="The spacy model to use")
     parser.add_argument("--embedding_model", type=str, default="BAAI/bge-large-en-v1.5", help="The path of embedding model to use")
     parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
@@ -100,7 +100,7 @@ def main():
         questions = questions[:args.question_limit]
     setup_logging(f"{output_dir}/log.txt")
 
-    model = Hyperflow(
+    model = HyperSU(
         save_dir=os.path.join(PROJECT_ROOT, f"index_store/{args.dataset_name}"),
         llm_model_name=args.llm_model,
         embedding_model_name=args.embedding_model,

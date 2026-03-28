@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class HyperflowConfig:
+class HyperSUConfig:
     save_dir: str = "./index_store"
     embedding_model_name: str = "BAAI/bge-large-en-v1.5"
     llm_model_name: str = "gpt-4o-mini"

@@ -1,131 +1,265 @@
-# Hyperflow: Description-Aware Hypergraph Indexing for Single-Step Multi-Hop Retrieval
+# HyperSU: Semantic-Unit Hypergraph Construction and Query-Gated Hypergraph Expansion
 
-> Hyperflow turns a document collection into a reasoning-ready hypergraph index. It builds a semantic-unit hypergraph with LLM-extracted canonical entities and frontier expansion to support single-step multi-hop retrieval for complex question answering.
+HyperSU is a hypergraph-based retrieval framework for multi-hop question answering.
+Its central object is not a flat passage index and not an LLM-generated relation graph,
+but a corpus-induced semantic hypergraph:
 
-## Overview
+- vertices are canonical entities
+- hyperedges are semantic units
+- retrieval is formulated as query-conditioned expansion on the entity-hyperedge incidence structure
 
-Many existing GraphRAG systems rely on LLMs in the offline indexing stage to extract relations, summarize communities, or generate graph structure. This makes indexing expensive and often introduces noisy, highly connected hub nodes that can dominate downstream reasoning.
+Instead of asking an LLM to synthesize explicit n-ary relation hyperedges, HyperSU builds
+hyperedges directly from semantic units in the source corpus, then performs gated frontier
+propagation over the resulting sparse hypergraph.
 
-Hyperflow is designed to address both issues:
+The method description in this README follows that hypergraph-first view of the project,
+including planner-guided sub-query gating and semantic-unit fallback expansion.
 
-- It builds a retrieval-oriented hypergraph directly from the corpus, without asking an LLM to generate explicit relations.
-- It uses LangExtract to produce semantic-unit mentions with grounded descriptions, then merges them into canonical entity nodes for hypergraph construction.
-- At query time, it performs hop-wise frontier expansion with conductance gating and progressive query steering, activating multiple related evidence chains in one retrieval pass.
-- This enables single-step multi-hop retrieval: instead of retrieving hop by hop, Hyperflow can connect scattered evidence across entities, semantic units, and passages in one shot.
+## Motivation
 
-## Core Idea
+For multi-hop retrieval, the core difficulty is usually not only ranking passages, but
+recovering the latent higher-order connectivity that links entities, intermediate evidence,
+and final answer evidence.
 
-Hyperflow has two stages: offline indexing and online retrieval.
+HyperSU approaches this problem from the hypergraph side:
 
-### 1. Offline Indexing: Build a Hypergraph from Semantic Units and Canonical Entities
+- Each semantic unit is treated as a higher-order connector rather than as an isolated text span.
+- The corpus is organized as a sparse entity-semantic-unit hypergraph rather than as a set of
+  independent passages.
+- Query processing becomes hypergraph expansion, not only nearest-neighbor passage lookup.
+- Complex questions are handled by sub-query-gated hyperedge activation, so different parts of
+  the reasoning chain can excite different regions of the hypergraph.
 
-Given a corpus of passages, Hyperflow:
+This makes the hypergraph the primary retrieval object, while passages are the final evidence
+projection target.
 
-1. Chunks the corpus into ~1200-token passages with overlap.
-2. Splits each passage into semantic units via Kamradt Percentile merging (embedding-based sentence grouping).
-3. Runs LangExtract on each semantic unit to extract grounded entity mentions with short descriptions.
-4. Merges mention-level entities into canonical global entity nodes using normalized names plus embedding similarity.
+## Hypergraph View
+
+HyperSU has two stages: hypergraph construction and hypergraph querying.
+
+### 1. Hypergraph Construction
+
+Given a corpus, HyperSU:
+
+1. Splits the corpus into passages using token-budgeted semantic chunking.
+2. Splits each passage into semantic units using embedding-based sentence grouping.
+3. Runs LangExtract on each semantic unit to extract grounded entity mentions.
+4. Merges mention-level variants into canonical entity nodes with normalized names and
+   embedding similarity.
 5. Treats each semantic unit as a hyperedge connecting all canonical entities that appear in it.
-6. Stores embeddings for passages, entities, and semantic units in Parquet files.
-7. Builds an auxiliary passage-entity graph for final ranking.
+6. Stores passage, entity, and semantic-unit embeddings for later hypergraph querying.
+7. Builds an auxiliary passage-entity projection map for final evidence scoring.
 
-Hyperedges come directly from canonical entity-semantic unit co-occurrence.
+This yields an entity-semantic-unit hypergraph:
 
-### 2. Online Retrieval: Single-Step Multi-Hop Reasoning
+- Vertex set `V`: canonical entities
+- Hyperedge set `E`: semantic units
+- Incidence matrix `H`: `H[v, e] = 1` iff entity vertex `v` belongs to semantic-unit hyperedge `e`
 
-For each question, Hyperflow:
+The semantic unit is therefore the basic higher-order neighborhood in the system. One
+hyperedge may connect multiple entities at once, which is exactly why the retrieval problem
+is framed as hypergraph exploration rather than ordinary pairwise graph traversal.
 
-1. Extracts seed entities from the query via LangExtract.
-2. Matches them to the nearest indexed entities by embedding similarity.
-3. Runs frontier expansion on the hypergraph:
-   - Each hop discovers new entities through query-relevant semantic units, gated by conductance.
-   - Progressive query steering shifts the query embedding toward discovered entities between hops.
-4. Scores passages via dual-channel fusion:
-   - Channel 1 (semantic): cosine similarity between passage and query embeddings.
-   - Channel 2 (coverage): activation-weighted entity coverage with IDF.
-5. Optionally reranks candidates with `Qwen/Qwen3-Reranker-4B`.
-6. Sends the retrieved evidence to a reader LLM to generate the answer.
+### 2. Hypergraph Querying
 
-## Core Algorithms
+For each question, HyperSU:
 
-### Hypergraph Structure
+1. Decomposes complex questions into sub-queries with a planner.
+2. Uses sub-query-to-SU relevance, rather than raw query-to-SU relevance, to assign gate
+   strength to semantic-unit hyperedges.
+3. Extracts seed entities from the query and maps them to canonical vertices in the hypergraph.
+4. Runs hop-wise frontier expansion over the hypergraph to discover new vertices through
+   gated hyperedges.
+5. If query-entity extraction fails, falls back to the single most relevant semantic unit,
+   performs one hyperedge pre-expansion step, and activates all entities contained in that
+   hyperedge as pseudo-seeds.
+6. Continues expansion from those activated entities, allowing later hops to naturally filter
+   noisy early activations through gated hypergraph propagation.
+7. Projects the activated entity set back to passages and ranks passages with a dual signal:
+   semantic relevance plus activated-entity coverage.
+8. Optionally reranks the final candidates with a local reranker.
+9. Sends the retrieved passages to a reader LLM for answer generation.
 
-Hyperflow models the corpus as an entity-semantic unit hypergraph:
+## Hypergraph Formulation
 
-- **Vertices**: canonical entities (built from mention-level entity + description pairs)
-- **Hyperedges**: semantic units (sentence groups produced by Kamradt Percentile chunking)
-- **Incidence matrix H**: `H[v, e] = 1` iff entity `v` appears in semantic unit `e`
+HyperSU can be read as a three-part retrieval pipeline:
 
-### Frontier Expansion
+1. Hypergraph construction:
+   build `H` from entity-hyperedge membership induced by semantic units.
+2. Hypergraph querying:
+   score and gate hyperedges, initialize seed vertices, and propagate activation.
+3. Hypergraph-to-passage projection:
+   map activated vertices onto passages for final evidence ranking.
 
-During retrieval, Hyperflow propagates relevance from seed entities through the hypergraph using explicit BFS-like hop-by-hop exploration:
+This separation is useful because it makes clear that passages are not the structure over
+which expansion happens. Expansion happens on the hypergraph; passages are only where the
+retrieved evidence is finally collected.
 
-1. **Conductance gating**: each semantic unit receives a conductance weight based on its embedding similarity to the query. Units below a floor threshold are suppressed entirely.
-2. **Hop propagation**: at each hop, frontier entity scores flow through high-conductance semantic units to discover new entities. Candidates are scored via max-aggregation and top-K selection.
-3. **Hop decay**: scores decay exponentially with hop distance (`score × decay^hop`).
-4. **Progressive query steering**: after each hop, the query embedding is shifted toward the centroid of top activated entities, updating conductance for the next hop.
+## Hypergraph Design Choices
 
-### Dual-Channel Passage Scoring
+### Semantic Units as Hyperedges
 
-After frontier expansion, passages are scored by fusing two signals:
+HyperSU does not ask an LLM to invent hyperedges. Instead, it derives hyperedges from
+corpus-local semantic units. This makes the hypergraph:
 
-```
-final_score(p) = λ · semantic(p) + (1-λ) · coverage(p)
-```
+- cheaper to build
+- easier to ground in source text
+- better aligned with evidence connectivity than with explicit relation extraction
 
-- `semantic(p)`: normalized cosine similarity between passage and query embeddings
-- `coverage(p)`: sum of (activation score × IDF) for each activated entity in the passage
-- `λ`: configurable fusion weight (default 0.5)
+The result is a retrieval hypergraph whose hyperedges correspond to local evidence groupings
+rather than abstract generated relations.
 
-### Reranking
+### Sub-Query-Gated Hyperedge Conductance
 
-Optionally, top candidates are reranked using a Qwen3-based reranker that scores query-document relevance via yes/no logit comparison.
+Using only `(query, SU)` similarity as the hyperedge gate can be too coarse for hard
+multi-hop questions, because one global query often mixes multiple latent evidence needs.
 
-## Repository Structure
+HyperSU therefore uses `(sub_query, SU)` similarity as the hyperedge conductance signal.
+The intuition is:
+
+- a sub-query can match an intermediate evidence unit more sharply
+- different hyperedges can be activated by different sub-queries
+- hypergraph expansion becomes more stable on complex reasoning questions
+
+This converts hyperedge activation from a single global score into a decomposition-aware
+conductance mechanism.
+
+### Hyperedge Pre-Expansion Fallback
+
+When LangExtract fails to extract query entities, HyperSU does not stop at dense passage
+retrieval.
+Instead, it:
+
+1. retrieves the most relevant semantic-unit hyperedge
+2. activates all entities contained in that hyperedge
+3. uses those entities as pseudo-seeds for the next expansion step
+
+This intentionally allows some early noise.
+The design assumption is that noisy entities introduced by the fallback step are acceptable,
+because later hypergraph expansion is still gated and scored, so irrelevant branches are
+naturally suppressed in subsequent hops.
+
+### Hypergraph Frontier Expansion
+
+HyperSU performs explicit hop-wise expansion on the entity-semantic-unit hypergraph.
+At each hop it:
+
+1. starts from the current frontier vertices
+2. finds reachable hyperedges under the gate
+3. propagates activation through those hyperedges
+4. discovers new entity vertices
+5. keeps the highest-value activated vertices for the next hop
+
+This is a genuine hypergraph retrieval step: activation flows from vertices to hyperedges and
+back to vertices, instead of traversing only pairwise edges.
+
+### Hypergraph-to-Passage Projection
+
+After hypergraph expansion, the activated vertices are projected back to passages.
+Passages are then ranked by combining:
+
+- semantic score: passage-query embedding similarity
+- coverage score: how much activated vertex evidence a passage contains
+
+The second term helps keep passages that may not look globally similar to the question, but
+contain crucial bridge entities discovered by the hypergraph expansion process.
+
+## Repository Layout
 
 ```text
-hyperflow/
-  config.py               # HyperflowConfig dataclass
-  engine.py               # Main engine: indexing, retrieval, QA pipeline
-  frontier.py             # Frontier expansion algorithm
-  knowledge_graph.py      # Hypergraph structure, entity-passage graph
-  embedding_store.py      # Parquet-backed embedding store
-  ner.py                  # LangExtract-based mention extraction
-  chunker.py              # Token chunking + Kamradt semantic unit splitting
-  entity_normalization.py # Mention normalization + canonical entity merging
-  reranker.py             # Qwen3 reranker
-  utils.py                # LLM wrapper, hashing, logging utilities
+hypersu/
+  __init__.py
+  config.py
+  engine.py
+  frontier.py
+  knowledge_graph.py
+  chunker.py
+  ner.py
+  entity_normalization.py
+  embedding_store.py
+  reranker.py
+  utils.py
+  planner.py
+
 benchmarks/
-  graphrag_bench/          # GraphRAG-Bench benchmark runner
-  multihop/                # Multi-hop QA benchmark runner (HotpotQA, 2WikiMultiHop, MuSiQue)
+  graphrag_bench/
+    bench.py
+    run.py
+  multihop/
+    evaluate.py
+    run.py
+
+figure/
+  main-result.png
 ```
+
+## Main Components
+
+### `hypersu/chunker.py`
+
+- token-aware corpus chunking
+- semantic-unit construction from sentence embeddings
+- semantic-unit length balancing by merge/split
+
+### `hypersu/ner.py`
+
+- LangExtract-based entity mention extraction
+- grounded mention metadata
+- query-time entity extraction
+
+### `hypersu/entity_normalization.py`
+
+- mention normalization
+- canonical entity construction
+- mention merging by name and embedding similarity
+
+### `hypersu/knowledge_graph.py`
+
+- entity-SU incidence mapping
+- sparse hypergraph construction
+- hypergraph storage and passage projection support
+
+### `hypersu/frontier.py`
+
+- hop-wise hypergraph frontier expansion
+- conductance-style hyperedge gating
+- multi-hop vertex activation
+
+### `hypersu/planner.py`
+
+- standalone query planner for complex-question decomposition
+- generates retrieval-oriented sub-queries
+- supports the sub-query-gated retrieval design described above
+
+### `hypersu/engine.py`
+
+- hypergraph construction pipeline
+- hypergraph querying pipeline
+- fallback initialization logic
+- QA generation pipeline
 
 ## Installation
 
-### 1. Install Python dependencies
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Install the spaCy model
+### 2. Install spaCy model
 
 ```bash
 python -m spacy download en_core_web_trf
 ```
 
-### 3. Set your LLM API credentials
+### 3. Set API credentials
 
-Hyperflow uses an OpenAI-compatible chat completion API for both LangExtract-based indexing and final answer generation.
+LangExtract-based extraction and answer generation use an OpenAI-compatible API.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_BASE_URL="your-base-url"
 ```
-
-### 4. Embedding model
-
-By default, the code uses `BAAI/bge-large-en-v1.5` via sentence-transformers (downloaded automatically from Hugging Face Hub).
 
 ## Quick Start
 
@@ -134,75 +268,98 @@ By default, the code uses `BAAI/bge-large-en-v1.5` via sentence-transformers (do
 ```bash
 python benchmarks/graphrag_bench/run.py \
   --corpus_name medical \
+  --llm_model gpt-4o-mini \
   --langextract_model gpt-4o-mini \
   --expansion_max_hops 3 \
+  --expansion_top_k 15 \
+  --conductance_floor 0.3 \
+  --conductance_gamma 1.0 \
   --scoring_lambda 0.7
 ```
 
-### Multi-hop QA
+Run a single corpus entry:
+
+```bash
+python benchmarks/graphrag_bench/run.py \
+  --corpus_name novel \
+  --corpus_entry Novel-30752 \
+  --question_limit 20
+```
+
+### Multi-Hop QA Datasets
 
 ```bash
 python benchmarks/multihop/run.py \
   --dataset_name hotpotqa \
+  --llm_model gpt-4o-mini \
   --langextract_model gpt-4o-mini \
   --expansion_max_hops 3 \
+  --expansion_top_k 15 \
   --scoring_lambda 0.7
 ```
 
-For a fast smoke test, limit the number of questions:
+## Important Arguments
 
-```bash
-python benchmarks/graphrag_bench/run.py \
-  --corpus_name medical \
-  --question_limit 20
+### Chunking and semantic units
+
+- `--chunk_size`: token budget for corpus chunking
+- `--chunk_overlap`: overlap between neighboring chunks
+- `--semantic_unit_percentile`: breakpoint percentile for semantic-unit splitting
+
+### Entity extraction
+
+- `--langextract_model`: model used by LangExtract
+- `--langextract_max_char_buffer`: max char buffer per extraction call
+- `--langextract_extraction_passes`: number of extraction passes
+
+### Retrieval and expansion
+
+- `--expansion_max_hops`: maximum number of hypergraph expansion hops
+- `--expansion_top_k`: number of newly activated vertices kept per hop
+- `--hop_decay`: hop-distance decay factor for propagated activation
+- `--conductance_floor`: floor for hyperedge gate suppression
+- `--conductance_gamma`: exponent for hyperedge conductance sharpening
+- `--scoring_lambda`: fusion weight between dense passage relevance and hypergraph coverage
+
+### Reranking
+
+- `--no_rerank`: disable reranking in GraphRAG-Bench runs
+- `--reranker_model`: reranker checkpoint
+- `--reranker_candidate_top_k`: candidates passed to reranker
+- `--reranker_batch_size`: reranker batch size
+- `--reranker_max_length`: reranker max token length
+
+## Outputs
+
+Typical outputs are written under:
+
+```text
+index_store/
+results/
 ```
 
-## Key Arguments
+Common files include:
 
-| Argument | Description | Default |
-| --- | --- | --- |
-| `--langextract_model` | Model used by LangExtract for mention extraction | `gpt-4o-mini` |
-| `--langextract_max_char_buffer` | Max char buffer per LangExtract extraction call | `1000` |
-| `--langextract_extraction_passes` | Sequential LangExtract passes for higher recall | `1` |
-| `--expansion_max_hops` | Max BFS hops from seed entities | `3` |
-| `--expansion_top_k` | New entities discovered per hop | `15` |
-| `--hop_decay` | Score decay per hop | `0.5` |
-| `--conductance_floor` | Query-SU similarity below this is suppressed | `0.3` |
-| `--conductance_gamma` | Conductance power exponent | `1.0` |
-| `--scoring_lambda` | Fusion weight (1.0 = pure dense, 0.0 = pure entity coverage) | `0.7` |
-| `--semantic_unit_percentile` | Kamradt percentile for SU boundary detection | `60` |
-| `--no_rerank` | Disable reranking | `false` |
-| `--reranker_model` | Reranker model path | `Qwen/Qwen3-Reranker-4B` |
-| `--reranker_candidate_top_k` | Candidates passed to reranker | `30` |
-| `--question_limit` | Limit number of questions (for debugging) | all |
-| `--skip_qa` / `--skip_eval` | Skip QA generation or evaluation | `false` |
-
-## Index Store
-
-Stored under `index_store/<dataset_name>/`:
-
-| File | Content |
-| --- | --- |
-| `passage_embedding.parquet` | Passage text + embeddings |
-| `entity_embedding.parquet` | Entity text + embeddings |
-| `su_embedding.parquet` | Semantic unit text + embeddings |
-| `ner_results.json` | Cached extraction results (passage → SU ids, SU hash → mention records) |
-| `entity_nodes.json` | Canonical entity node metadata |
-
-### Run Outputs
-
-Stored under `results/<dataset_name>/<timestamp>/`:
-
+- `passage_embedding.parquet`
+- `entity_embedding.parquet`
+- `su_embedding.parquet`
+- `ner_results.json`
+- `entity_nodes.json`
 - `predictions.json`
-- `evaluation_results.json`
+- `generation_eval.json`
+- `retrieval_eval.json`
 - `log.txt`
 
 ## Notes
 
-- Hyperflow now uses an LLM during indexing through LangExtract to create mention-level entities with grounded descriptions.
-- The reranker is loaded locally through Hugging Face Transformers and may require substantial GPU memory.
-- The default code path uses CUDA when available for embedding inference, hypergraph operations, and reranking.
+- HyperSU should be understood first as a semantic hypergraph retrieval method and only
+  second as a downstream RAG pipeline.
+- LangExtract is used to ground entity vertices, while semantic units define the hyperedges.
+- The planner-guided gate is designed to control which hyperedges become conductive for
+  expansion on complex multi-hop questions.
+- The SU pre-expand fallback is a hypergraph initialization strategy for cases where query-side
+  vertex extraction is sparse or fails.
 
 ## License
 
-This repository is released under the license provided in `LICENSE.txt`.
+Please refer to the repository license file if one is provided.

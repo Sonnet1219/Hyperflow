@@ -1,4 +1,4 @@
-"""Run Hyperflow on GraphRAG-Bench benchmark.
+"""Run HyperSU on GraphRAG-Bench benchmark.
 
 Pipeline:
   1. Load corpus entries & questions from local HuggingFace cache
@@ -17,13 +17,13 @@ from collections import defaultdict
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Ensure project root is on sys.path so `hyperflow` is importable
+# Ensure project root is on sys.path so `hypersu` is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-from hyperflow.engine import Hyperflow
-from hyperflow.chunker import chunk_corpus_by_tokens
-from hyperflow.utils import setup_logging
+from hypersu.engine import HyperSU
+from hypersu.chunker import chunk_corpus_by_tokens
+from hypersu.utils import setup_logging
 from bench import load_corpus, load_questions, format_results
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -37,7 +37,7 @@ EVAL_REPO_DIR = os.path.expanduser("~/GraphRAG-Benchmark")
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Run Hyperflow on GraphRAG-Bench",
+        description="Run HyperSU on GraphRAG-Bench",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -251,8 +251,8 @@ def main():
         print(f"Processing {corpus_name}: {len(questions)} questions, {len(corpus_text)} chars")
         print(f"{'='*60}")
 
-        # Create Hyperflow instance with per-corpus index
-        model = Hyperflow(
+        # Create HyperSU instance with per-corpus index
+        model = HyperSU(
             save_dir=os.path.join(PROJECT_ROOT, f"index_store/graphrag-bench-{args.corpus_name}/{corpus_name}"),
             llm_model_name=args.llm_model,
             embedding_model_name=args.embedding_model,
